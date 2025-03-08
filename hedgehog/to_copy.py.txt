@@ -1,0 +1,3978 @@
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/backtester.py
+import sys
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import questionary
+import matplotlib.pyplot as plt
+import pandas as pd
+from colorama import Fore, Style, init
+import numpy as np
+import itertools
+from llm.models import LLM_ORDER, get_model_info
+from utils.analysts import ANALYST_ORDER
+from main import run_hedge_fund
+from tools.api import (
+get_company_news,
+get_price_data,
+get_prices,
+get_financial_metrics,
+get_insider_trades,
+)
+from utils.display import print_backtest_results, format_backtest_row
+from typing_extensions import Callable
+init(autoreset=True)
+class Backtester:
+def __init__(
+self,
+agent: Callable,
+tickers: list[str],
+start_date: str,
+end_date: str,
+initial_capital: float,
+model_name: str = "gpt-4o",
+model_provider: str = "OpenAI",
+selected_analysts: list[str] = [],
+initial_margin_requirement: float = 0.0,
+):
+self.agent = agent
+self.tickers = tickers
+self.start_date = start_date
+self.end_date = end_date
+self.initial_capital = initial_capital
+self.model_name = model_name
+self.model_provider = model_provider
+self.selected_analysts = selected_analysts
+self.margin_ratio = initial_margin_requirement
+self.portfolio_values = []
+self.portfolio = {
+"cash": initial_capital,
+"margin_used": 0.0,
+"positions": {
+ticker: {
+"long": 0,
+"short": 0,
+"long_cost_basis": 0.0,
+"short_cost_basis": 0.0,
+"short_margin_used": 0.0
+} for ticker in tickers
+},
+"realized_gains": {
+ticker: {
+"long": 0.0,
+"short": 0.0,
+} for ticker in tickers
+}
+}
+def execute_trade(self, ticker: str, action: str, quantity: float, current_price: float):
+if quantity <= 0:
+return 0
+quantity = int(quantity)
+position = self.portfolio["positions"][ticker]
+if action == "buy":
+cost = quantity * current_price
+if cost <= self.portfolio["cash"]:
+old_shares = position["long"]
+old_cost_basis = position["long_cost_basis"]
+new_shares = quantity
+total_shares = old_shares + new_shares
+if total_shares > 0:
+total_old_cost = old_cost_basis * old_shares
+total_new_cost = cost
+position["long_cost_basis"] = (total_old_cost + total_new_cost) / total_shares
+position["long"] += quantity
+self.portfolio["cash"] -= cost
+return quantity
+else:
+max_quantity = int(self.portfolio["cash"] / current_price)
+if max_quantity > 0:
+cost = max_quantity * current_price
+old_shares = position["long"]
+old_cost_basis = position["long_cost_basis"]
+total_shares = old_shares + max_quantity
+if total_shares > 0:
+total_old_cost = old_cost_basis * old_shares
+total_new_cost = cost
+position["long_cost_basis"] = (total_old_cost + total_new_cost) / total_shares
+position["long"] += max_quantity
+self.portfolio["cash"] -= cost
+return max_quantity
+return 0
+elif action == "sell":
+quantity = min(quantity, position["long"])
+if quantity > 0:
+avg_cost_per_share = position["long_cost_basis"] if position["long"] > 0 else 0
+realized_gain = (current_price - avg_cost_per_share) * quantity
+self.portfolio["realized_gains"][ticker]["long"] += realized_gain
+position["long"] -= quantity
+self.portfolio["cash"] += quantity * current_price
+if position["long"] == 0:
+position["long_cost_basis"] = 0.0
+return quantity
+elif action == "short":
+proceeds = current_price * quantity
+margin_required = proceeds * self.margin_ratio
+if margin_required <= self.portfolio["cash"]:
+old_short_shares = position["short"]
+old_cost_basis = position["short_cost_basis"]
+new_shares = quantity
+total_shares = old_short_shares + new_shares
+if total_shares > 0:
+total_old_cost = old_cost_basis * old_short_shares
+total_new_cost = current_price * new_shares
+position["short_cost_basis"] = (total_old_cost + total_new_cost) / total_shares
+position["short"] += quantity
+position["short_margin_used"] += margin_required
+self.portfolio["margin_used"] += margin_required
+self.portfolio["cash"] += proceeds
+self.portfolio["cash"] -= margin_required
+return quantity
+else:
+if self.margin_ratio > 0:
+max_quantity = int(self.portfolio["cash"] / (current_price * self.margin_ratio))
+else:
+max_quantity = 0
+if max_quantity > 0:
+proceeds = current_price * max_quantity
+margin_required = proceeds * self.margin_ratio
+old_short_shares = position["short"]
+old_cost_basis = position["short_cost_basis"]
+total_shares = old_short_shares + max_quantity
+if total_shares > 0:
+total_old_cost = old_cost_basis * old_short_shares
+total_new_cost = current_price * max_quantity
+position["short_cost_basis"] = (total_old_cost + total_new_cost) / total_shares
+position["short"] += max_quantity
+position["short_margin_used"] += margin_required
+self.portfolio["margin_used"] += margin_required
+self.portfolio["cash"] += proceeds
+self.portfolio["cash"] -= margin_required
+return max_quantity
+return 0
+elif action == "cover":
+quantity = min(quantity, position["short"])
+if quantity > 0:
+cover_cost = quantity * current_price
+avg_short_price = position["short_cost_basis"] if position["short"] > 0 else 0
+realized_gain = (avg_short_price - current_price) * quantity
+if position["short"] > 0:
+portion = quantity / position["short"]
+else:
+portion = 1.0
+margin_to_release = portion * position["short_margin_used"]
+position["short"] -= quantity
+position["short_margin_used"] -= margin_to_release
+self.portfolio["margin_used"] -= margin_to_release
+self.portfolio["cash"] += margin_to_release
+self.portfolio["cash"] -= cover_cost
+self.portfolio["realized_gains"][ticker]["short"] += realized_gain
+if position["short"] == 0:
+position["short_cost_basis"] = 0.0
+position["short_margin_used"] = 0.0
+return quantity
+return 0
+def calculate_portfolio_value(self, current_prices):
+total_value = self.portfolio["cash"]
+for ticker in self.tickers:
+position = self.portfolio["positions"][ticker]
+price = current_prices[ticker]
+long_value = position["long"] * price
+total_value += long_value
+if position["short"] > 0:
+total_value += position["short"] * (position["short_cost_basis"] - price)
+return total_value
+def prefetch_data(self):
+print("\nPre-fetching data for the entire backtest period...")
+end_date_dt = datetime.strptime(self.end_date, "%Y-%m-%d")
+start_date_dt = end_date_dt - relativedelta(years=1)
+start_date_str = start_date_dt.strftime("%Y-%m-%d")
+for ticker in self.tickers:
+get_prices(ticker, start_date_str, self.end_date)
+get_financial_metrics(ticker, self.end_date, limit=10)
+get_insider_trades(ticker, self.end_date, start_date=self.start_date, limit=1000)
+get_company_news(ticker, self.end_date, start_date=self.start_date, limit=1000)
+print("Data pre-fetch complete.")
+def parse_agent_response(self, agent_output):
+import json
+try:
+decision = json.loads(agent_output)
+return decision
+except Exception:
+print(f"Error parsing action: {agent_output}")
+return {"action": "hold", "quantity": 0}
+def run_backtest(self):
+self.prefetch_data()
+dates = pd.date_range(self.start_date, self.end_date, freq="B")
+table_rows = []
+performance_metrics = {
+'sharpe_ratio': None,
+'sortino_ratio': None,
+'max_drawdown': None,
+'long_short_ratio': None,
+'gross_exposure': None,
+'net_exposure': None
+}
+print("\nStarting backtest...")
+if len(dates) > 0:
+self.portfolio_values = [{"Date": dates[0], "Portfolio Value": self.initial_capital}]
+else:
+self.portfolio_values = []
+for current_date in dates:
+lookback_start = (current_date - timedelta(days=30)).strftime("%Y-%m-%d")
+current_date_str = current_date.strftime("%Y-%m-%d")
+previous_date_str = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+if lookback_start == current_date_str:
+continue
+try:
+current_prices = {
+ticker: get_price_data(ticker, previous_date_str, current_date_str).iloc[-1]["close"]
+for ticker in self.tickers
+}
+except Exception:
+print(f"Error fetching prices between {previous_date_str} and {current_date_str}")
+continue
+output = self.agent(
+tickers=self.tickers,
+start_date=lookback_start,
+end_date=current_date_str,
+portfolio=self.portfolio,
+model_name=self.model_name,
+model_provider=self.model_provider,
+selected_analysts=self.selected_analysts,
+)
+decisions = output["decisions"]
+analyst_signals = output["analyst_signals"]
+executed_trades = {}
+for ticker in self.tickers:
+decision = decisions.get(ticker, {"action": "hold", "quantity": 0})
+action, quantity = decision.get("action", "hold"), decision.get("quantity", 0)
+executed_quantity = self.execute_trade(ticker, action, quantity, current_prices[ticker])
+executed_trades[ticker] = executed_quantity
+total_value = self.calculate_portfolio_value(current_prices)
+long_exposure = sum(
+self.portfolio["positions"][t]["long"] * current_prices[t]
+for t in self.tickers
+)
+short_exposure = sum(
+self.portfolio["positions"][t]["short"] * current_prices[t]
+for t in self.tickers
+)
+gross_exposure = long_exposure + short_exposure
+net_exposure = long_exposure - short_exposure
+long_short_ratio = (
+long_exposure / short_exposure if short_exposure > 1e-9 else float('inf')
+)
+self.portfolio_values.append({
+"Date": current_date,
+"Portfolio Value": total_value,
+"Long Exposure": long_exposure,
+"Short Exposure": short_exposure,
+"Gross Exposure": gross_exposure,
+"Net Exposure": net_exposure,
+"Long/Short Ratio": long_short_ratio
+})
+date_rows = []
+for ticker in self.tickers:
+ticker_signals = {}
+for agent_name, signals in analyst_signals.items():
+if ticker in signals:
+ticker_signals[agent_name] = signals[ticker]
+bullish_count = len([s for s in ticker_signals.values() if s.get("signal", "").lower() == "bullish"])
+bearish_count = len([s for s in ticker_signals.values() if s.get("signal", "").lower() == "bearish"])
+neutral_count = len([s for s in ticker_signals.values() if s.get("signal", "").lower() == "neutral"])
+pos = self.portfolio["positions"][ticker]
+long_val = pos["long"] * current_prices[ticker]
+short_val = pos["short"] * current_prices[ticker]
+net_position_value = long_val - short_val
+action = decisions.get(ticker, {}).get("action", "hold")
+quantity = executed_trades.get(ticker, 0)
+date_rows.append(
+format_backtest_row(
+date=current_date_str,
+ticker=ticker,
+action=action,
+quantity=quantity,
+price=current_prices[ticker],
+shares_owned=pos["long"] - pos["short"],
+position_value=net_position_value,
+bullish_count=bullish_count,
+bearish_count=bearish_count,
+neutral_count=neutral_count,
+)
+)
+total_realized_gains = sum(
+self.portfolio["realized_gains"][t]["long"] +
+self.portfolio["realized_gains"][t]["short"]
+for t in self.tickers
+)
+portfolio_return = ((total_value + total_realized_gains) / self.initial_capital - 1) * 100
+date_rows.append(
+format_backtest_row(
+date=current_date_str,
+ticker="",
+action="",
+quantity=0,
+price=0,
+shares_owned=0,
+position_value=0,
+bullish_count=0,
+bearish_count=0,
+neutral_count=0,
+is_summary=True,
+total_value=total_value,
+return_pct=portfolio_return,
+cash_balance=self.portfolio["cash"],
+total_position_value=total_value - self.portfolio["cash"],
+sharpe_ratio=performance_metrics["sharpe_ratio"],
+sortino_ratio=performance_metrics["sortino_ratio"],
+max_drawdown=performance_metrics["max_drawdown"],
+),
+)
+table_rows.extend(date_rows)
+print_backtest_results(table_rows)
+if len(self.portfolio_values) > 3:
+self._update_performance_metrics(performance_metrics)
+return performance_metrics
+def _update_performance_metrics(self, performance_metrics):
+values_df = pd.DataFrame(self.portfolio_values).set_index("Date")
+values_df["Daily Return"] = values_df["Portfolio Value"].pct_change()
+clean_returns = values_df["Daily Return"].dropna()
+if len(clean_returns) < 2:
+return
+daily_risk_free_rate = 0.0434 / 252
+excess_returns = clean_returns - daily_risk_free_rate
+mean_excess_return = excess_returns.mean()
+std_excess_return = excess_returns.std()
+if std_excess_return > 1e-12:
+performance_metrics["sharpe_ratio"] = np.sqrt(252) * (mean_excess_return / std_excess_return)
+else:
+performance_metrics["sharpe_ratio"] = 0.0
+negative_returns = excess_returns[excess_returns < 0]
+if len(negative_returns) > 0:
+downside_std = negative_returns.std()
+if downside_std > 1e-12:
+performance_metrics["sortino_ratio"] = np.sqrt(252) * (mean_excess_return / downside_std)
+else:
+performance_metrics["sortino_ratio"] = float('inf') if mean_excess_return > 0 else 0
+else:
+performance_metrics["sortino_ratio"] = float('inf') if mean_excess_return > 0 else 0
+rolling_max = values_df["Portfolio Value"].cummax()
+drawdown = (values_df["Portfolio Value"] - rolling_max) / rolling_max
+performance_metrics["max_drawdown"] = drawdown.min() * 100
+def analyze_performance(self):
+if not self.portfolio_values:
+print("No portfolio data found. Please run the backtest first.")
+return pd.DataFrame()
+performance_df = pd.DataFrame(self.portfolio_values).set_index("Date")
+if performance_df.empty:
+print("No valid performance data to analyze.")
+return performance_df
+final_portfolio_value = performance_df["Portfolio Value"].iloc[-1]
+total_realized_gains = sum(
+self.portfolio["realized_gains"][ticker]["long"] for ticker in self.tickers
+)
+total_return = ((final_portfolio_value - self.initial_capital) / self.initial_capital) * 100
+print(f"\n{Fore.WHITE}{Style.BRIGHT}PORTFOLIO PERFORMANCE SUMMARY:{Style.RESET_ALL}")
+print(f"Total Return: {Fore.GREEN if total_return >= 0 else Fore.RED}{total_return:.2f}%{Style.RESET_ALL}")
+print(f"Total Realized Gains/Losses: {Fore.GREEN if total_realized_gains >= 0 else Fore.RED}${total_realized_gains:,.2f}{Style.RESET_ALL}")
+plt.figure(figsize=(12, 6))
+plt.plot(performance_df.index, performance_df["Portfolio Value"], color="blue")
+plt.title("Portfolio Value Over Time")
+plt.ylabel("Portfolio Value ($)")
+plt.xlabel("Date")
+plt.grid(True)
+plt.show()
+performance_df["Daily Return"] = performance_df["Portfolio Value"].pct_change().fillna(0)
+daily_rf = 0.0434 / 252
+mean_daily_return = performance_df["Daily Return"].mean()
+std_daily_return = performance_df["Daily Return"].std()
+if std_daily_return != 0:
+annualized_sharpe = np.sqrt(252) * ((mean_daily_return - daily_rf) / std_daily_return)
+else:
+annualized_sharpe = 0
+print(f"\nSharpe Ratio: {Fore.YELLOW}{annualized_sharpe:.2f}{Style.RESET_ALL}")
+rolling_max = performance_df["Portfolio Value"].cummax()
+drawdown = (performance_df["Portfolio Value"] - rolling_max) / rolling_max
+max_drawdown = drawdown.min()
+max_drawdown_date = drawdown.idxmin()
+if pd.notnull(max_drawdown_date):
+print(f"Maximum Drawdown: {Fore.RED}{max_drawdown * 100:.2f}%{Style.RESET_ALL} (on {max_drawdown_date.strftime('%Y-%m-%d')})")
+else:
+print(f"Maximum Drawdown: {Fore.RED}0.00%{Style.RESET_ALL}")
+winning_days = len(performance_df[performance_df["Daily Return"] > 0])
+total_days = max(len(performance_df) - 1, 1)
+win_rate = (winning_days / total_days) * 100
+print(f"Win Rate: {Fore.GREEN}{win_rate:.2f}%{Style.RESET_ALL}")
+positive_returns = performance_df[performance_df["Daily Return"] > 0]["Daily Return"]
+negative_returns = performance_df[performance_df["Daily Return"] < 0]["Daily Return"]
+avg_win = positive_returns.mean() if not positive_returns.empty else 0
+avg_loss = abs(negative_returns.mean()) if not negative_returns.empty else 0
+if avg_loss != 0:
+win_loss_ratio = avg_win / avg_loss
+else:
+win_loss_ratio = float('inf') if avg_win > 0 else 0
+print(f"Win/Loss Ratio: {Fore.GREEN}{win_loss_ratio:.2f}{Style.RESET_ALL}")
+returns_binary = (performance_df["Daily Return"] > 0).astype(int)
+if len(returns_binary) > 0:
+max_consecutive_wins = max((len(list(g)) for k, g in itertools.groupby(returns_binary) if k == 1), default=0)
+max_consecutive_losses = max((len(list(g)) for k, g in itertools.groupby(returns_binary) if k == 0), default=0)
+else:
+max_consecutive_wins = 0
+max_consecutive_losses = 0
+print(f"Max Consecutive Wins: {Fore.GREEN}{max_consecutive_wins}{Style.RESET_ALL}")
+print(f"Max Consecutive Losses: {Fore.RED}{max_consecutive_losses}{Style.RESET_ALL}")
+return performance_df
+if __name__ == "__main__":
+import argparse
+parser = argparse.ArgumentParser(description="Run backtesting simulation")
+parser.add_argument(
+"--tickers",
+type=str,
+required=False,
+help="Comma-separated list of stock ticker symbols (e.g., AAPL,MSFT,GOOGL)",
+)
+parser.add_argument(
+"--end-date",
+type=str,
+default=datetime.now().strftime("%Y-%m-%d"),
+help="End date in YYYY-MM-DD format",
+)
+parser.add_argument(
+"--start-date",
+type=str,
+default=(datetime.now() - relativedelta(months=1)).strftime("%Y-%m-%d"),
+help="Start date in YYYY-MM-DD format",
+)
+parser.add_argument(
+"--initial-capital",
+type=float,
+default=100000,
+help="Initial capital amount (default: 100000)",
+)
+parser.add_argument(
+"--margin-requirement",
+type=float,
+default=0.0,
+help="Margin ratio for short positions, e.g. 0.5 for 50% (default: 0.0)",
+)
+args = parser.parse_args()
+tickers = [ticker.strip() for ticker in args.tickers.split(",")] if args.tickers else []
+selected_analysts = None
+choices = questionary.checkbox(
+"Use the Space bar to select/unselect analysts.",
+choices=[questionary.Choice(display, value=value) for display, value in ANALYST_ORDER],
+instruction="\n\nPress 'a' to toggle all.\n\nPress Enter when done to run the hedge fund.",
+validate=lambda x: len(x) > 0 or "You must select at least one analyst.",
+style=questionary.Style(
+[
+("checkbox-selected", "fg:green"),
+("selected", "fg:green noinherit"),
+("highlighted", "noinherit"),
+("pointer", "noinherit"),
+]
+),
+).ask()
+if not choices:
+print("\n\nInterrupt received. Exiting...")
+sys.exit(0)
+else:
+selected_analysts = choices
+print(
+f"\nSelected analysts: "
+f"{', '.join(Fore.GREEN + choice.title().replace('_', ' ') + Style.RESET_ALL for choice in choices)}"
+)
+model_choice = questionary.select(
+"Select your LLM model:",
+choices=[questionary.Choice(display, value=value) for display, value, _ in LLM_ORDER],
+style=questionary.Style([
+("selected", "fg:green bold"),
+("pointer", "fg:green bold"),
+("highlighted", "fg:green"),
+("answer", "fg:green bold"),
+])
+).ask()
+if not model_choice:
+print("\n\nInterrupt received. Exiting...")
+sys.exit(0)
+else:
+model_info = get_model_info(model_choice)
+if model_info:
+model_provider = model_info.provider.value
+print(f"\nSelected {Fore.CYAN}{model_provider}{Style.RESET_ALL} model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
+else:
+model_provider = "Unknown"
+print(f"\nSelected model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
+backtester = Backtester(
+agent=run_hedge_fund,
+tickers=tickers,
+start_date=args.start_date,
+end_date=args.end_date,
+initial_capital=args.initial_capital,
+model_name=model_choice,
+model_provider=model_provider,
+selected_analysts=selected_analysts,
+initial_margin_requirement=args.margin_requirement,
+)
+performance_metrics = backtester.run_backtest()
+performance_df = backtester.analyze_performance()
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/main.py
+import sys
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
+from langgraph.graph import END, StateGraph
+from colorama import Fore, Back, Style, init
+import questionary
+from agents.ben_graham import ben_graham_agent
+from agents.bill_ackman import bill_ackman_agent
+from agents.fundamentals import fundamentals_agent
+from agents.portfolio_manager import portfolio_management_agent
+from agents.technicals import technical_analyst_agent
+from agents.risk_manager import risk_management_agent
+from agents.sentiment import sentiment_agent
+from agents.warren_buffett import warren_buffett_agent
+from graph.state import AgentState
+from agents.valuation import valuation_agent
+from utils.display import print_trading_output
+from utils.analysts import ANALYST_ORDER, get_analyst_nodes
+from utils.progress import progress
+from llm.models import LLM_ORDER, get_model_info
+import argparse
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from tabulate import tabulate
+from utils.visualize import save_graph_as_png
+load_dotenv()
+init(autoreset=True)
+def parse_hedge_fund_response(response):
+import json
+try:
+return json.loads(response)
+except:
+print(f"Error parsing response: {response}")
+return None
+def run_hedge_fund(
+tickers: list[str],
+start_date: str,
+end_date: str,
+portfolio: dict,
+show_reasoning: bool = False,
+selected_analysts: list[str] = [],
+model_name: str = "gpt-4o",
+model_provider: str = "OpenAI",
+):
+progress.start()
+try:
+if selected_analysts:
+workflow = create_workflow(selected_analysts)
+agent = workflow.compile()
+else:
+agent = app
+final_state = agent.invoke(
+{
+"messages": [
+HumanMessage(
+content="Make trading decisions based on the provided data.",
+)
+],
+"data": {
+"tickers": tickers,
+"portfolio": portfolio,
+"start_date": start_date,
+"end_date": end_date,
+"analyst_signals": {},
+},
+"metadata": {
+"show_reasoning": show_reasoning,
+"model_name": model_name,
+"model_provider": model_provider,
+},
+},
+)
+return {
+"decisions": parse_hedge_fund_response(final_state["messages"][-1].content),
+"analyst_signals": final_state["data"]["analyst_signals"],
+}
+finally:
+progress.stop()
+def start(state: AgentState):
+return state
+def create_workflow(selected_analysts=None):
+workflow = StateGraph(AgentState)
+workflow.add_node("start_node", start)
+analyst_nodes = get_analyst_nodes()
+if selected_analysts is None:
+selected_analysts = list(analyst_nodes.keys())
+for analyst_key in selected_analysts:
+node_name, node_func = analyst_nodes[analyst_key]
+workflow.add_node(node_name, node_func)
+workflow.add_edge("start_node", node_name)
+workflow.add_node("risk_management_agent", risk_management_agent)
+workflow.add_node("portfolio_management_agent", portfolio_management_agent)
+for analyst_key in selected_analysts:
+node_name = analyst_nodes[analyst_key][0]
+workflow.add_edge(node_name, "risk_management_agent")
+workflow.add_edge("risk_management_agent", "portfolio_management_agent")
+workflow.add_edge("portfolio_management_agent", END)
+workflow.set_entry_point("start_node")
+return workflow
+if __name__ == "__main__":
+parser = argparse.ArgumentParser(description="Run the hedge fund trading system")
+parser.add_argument(
+"--initial-cash",
+type=float,
+default=100000.0,
+help="Initial cash position. Defaults to 100000.0)"
+)
+parser.add_argument(
+"--margin-requirement",
+type=float,
+default=0.0,
+help="Initial margin requirement. Defaults to 0.0"
+)
+parser.add_argument("--tickers", type=str, required=True, help="Comma-separated list of stock ticker symbols")
+parser.add_argument(
+"--start-date",
+type=str,
+help="Start date (YYYY-MM-DD). Defaults to 3 months before end date",
+)
+parser.add_argument("--end-date", type=str, help="End date (YYYY-MM-DD). Defaults to today")
+parser.add_argument("--show-reasoning", action="store_true", help="Show reasoning from each agent")
+parser.add_argument(
+"--show-agent-graph", action="store_true", help="Show the agent graph"
+)
+args = parser.parse_args()
+tickers = [ticker.strip() for ticker in args.tickers.split(",")]
+selected_analysts = None
+choices = questionary.checkbox(
+"Select your AI analysts.",
+choices=[questionary.Choice(display, value=value) for display, value in ANALYST_ORDER],
+instruction="\n\nInstructions: \n1. Press Space to select/unselect analysts.\n2. Press 'a' to select/unselect all.\n3. Press Enter when done to run the hedge fund.\n",
+validate=lambda x: len(x) > 0 or "You must select at least one analyst.",
+style=questionary.Style(
+[
+("checkbox-selected", "fg:green"),
+("selected", "fg:green noinherit"),
+("highlighted", "noinherit"),
+("pointer", "noinherit"),
+]
+),
+).ask()
+if not choices:
+print("\n\nInterrupt received. Exiting...")
+sys.exit(0)
+else:
+selected_analysts = choices
+print(f"\nSelected analysts: {', '.join(Fore.GREEN + choice.title().replace('_', ' ') + Style.RESET_ALL for choice in choices)}\n")
+model_choice = questionary.select(
+"Select your LLM model:",
+choices=[questionary.Choice(display, value=value) for display, value, _ in LLM_ORDER],
+style=questionary.Style([
+("selected", "fg:green bold"),
+("pointer", "fg:green bold"),
+("highlighted", "fg:green"),
+("answer", "fg:green bold"),
+])
+).ask()
+if not model_choice:
+print("\n\nInterrupt received. Exiting...")
+sys.exit(0)
+else:
+model_info = get_model_info(model_choice)
+if model_info:
+model_provider = model_info.provider.value
+print(f"\nSelected {Fore.CYAN}{model_provider}{Style.RESET_ALL} model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
+else:
+model_provider = "Unknown"
+print(f"\nSelected model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
+workflow = create_workflow(selected_analysts)
+app = workflow.compile()
+if args.show_agent_graph:
+file_path = ""
+if selected_analysts is not None:
+for selected_analyst in selected_analysts:
+file_path += selected_analyst + "_"
+file_path += "graph.png"
+save_graph_as_png(app, file_path)
+if args.start_date:
+try:
+datetime.strptime(args.start_date, "%Y-%m-%d")
+except ValueError:
+raise ValueError("Start date must be in YYYY-MM-DD format")
+if args.end_date:
+try:
+datetime.strptime(args.end_date, "%Y-%m-%d")
+except ValueError:
+raise ValueError("End date must be in YYYY-MM-DD format")
+end_date = args.end_date or datetime.now().strftime("%Y-%m-%d")
+if not args.start_date:
+end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+start_date = (end_date_obj - relativedelta(months=3)).strftime("%Y-%m-%d")
+else:
+start_date = args.start_date
+portfolio = {
+"cash": args.initial_cash,
+"margin_requirement": args.margin_requirement,
+"positions": {
+ticker: {
+"long": 0,
+"short": 0,
+"long_cost_basis": 0.0,
+"short_cost_basis": 0.0,
+} for ticker in tickers
+},
+"realized_gains": {
+ticker: {
+"long": 0.0,
+"short": 0.0,
+} for ticker in tickers
+}
+}
+result = run_hedge_fund(
+tickers=tickers,
+start_date=start_date,
+end_date=end_date,
+portfolio=portfolio,
+show_reasoning=args.show_reasoning,
+selected_analysts=selected_analysts,
+model_name=model_choice,
+model_provider=model_provider,
+)
+print_trading_output(result)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/tools/api.py
+import os
+import pandas as pd
+import requests
+from data.cache import get_cache
+from data.models import (
+CompanyNews,
+CompanyNewsResponse,
+FinancialMetrics,
+FinancialMetricsResponse,
+Price,
+PriceResponse,
+LineItem,
+LineItemResponse,
+InsiderTrade,
+InsiderTradeResponse,
+)
+_cache = get_cache()
+def get_prices(ticker: str, start_date: str, end_date: str) -> list[Price]:
+if cached_data := _cache.get_prices(ticker):
+filtered_data = [Price(**price) for price in cached_data if start_date <= price["time"] <= end_date]
+if filtered_data:
+return filtered_data
+headers = {}
+if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+headers["X-API-KEY"] = api_key
+url = f"https://api.financialdatasets.ai/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
+response = requests.get(url, headers=headers)
+if response.status_code != 200:
+raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
+price_response = PriceResponse(**response.json())
+prices = price_response.prices
+if not prices:
+return []
+_cache.set_prices(ticker, [p.model_dump() for p in prices])
+return prices
+def get_financial_metrics(
+ticker: str,
+end_date: str,
+period: str = "ttm",
+limit: int = 10,
+) -> list[FinancialMetrics]:
+if cached_data := _cache.get_financial_metrics(ticker):
+filtered_data = [FinancialMetrics(**metric) for metric in cached_data if metric["report_period"] <= end_date]
+filtered_data.sort(key=lambda x: x.report_period, reverse=True)
+if filtered_data:
+return filtered_data[:limit]
+headers = {}
+if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+headers["X-API-KEY"] = api_key
+url = f"https://api.financialdatasets.ai/financial-metrics/?ticker={ticker}&report_period_lte={end_date}&limit={limit}&period={period}"
+response = requests.get(url, headers=headers)
+if response.status_code != 200:
+raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
+metrics_response = FinancialMetricsResponse(**response.json())
+financial_metrics = metrics_response.financial_metrics
+if not financial_metrics:
+return []
+_cache.set_financial_metrics(ticker, [m.model_dump() for m in financial_metrics])
+return financial_metrics
+def search_line_items(
+ticker: str,
+line_items: list[str],
+end_date: str,
+period: str = "ttm",
+limit: int = 10,
+) -> list[LineItem]:
+headers = {}
+if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+headers["X-API-KEY"] = api_key
+url = "https://api.financialdatasets.ai/financials/search/line-items"
+body = {
+"tickers": [ticker],
+"line_items": line_items,
+"end_date": end_date,
+"period": period,
+"limit": limit,
+}
+response = requests.post(url, headers=headers, json=body)
+if response.status_code != 200:
+raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
+data = response.json()
+response_model = LineItemResponse(**data)
+search_results = response_model.search_results
+if not search_results:
+return []
+return search_results[:limit]
+def get_insider_trades(
+ticker: str,
+end_date: str,
+start_date: str | None = None,
+limit: int = 1000,
+) -> list[InsiderTrade]:
+if cached_data := _cache.get_insider_trades(ticker):
+filtered_data = [InsiderTrade(**trade) for trade in cached_data
+if (start_date is None or (trade.get("transaction_date") or trade["filing_date"]) >= start_date)
+and (trade.get("transaction_date") or trade["filing_date"]) <= end_date]
+filtered_data.sort(key=lambda x: x.transaction_date or x.filing_date, reverse=True)
+if filtered_data:
+return filtered_data
+headers = {}
+if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+headers["X-API-KEY"] = api_key
+all_trades = []
+current_end_date = end_date
+while True:
+url = f"https://api.financialdatasets.ai/insider-trades/?ticker={ticker}&filing_date_lte={current_end_date}"
+if start_date:
+url += f"&filing_date_gte={start_date}"
+url += f"&limit={limit}"
+response = requests.get(url, headers=headers)
+if response.status_code != 200:
+raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
+data = response.json()
+response_model = InsiderTradeResponse(**data)
+insider_trades = response_model.insider_trades
+if not insider_trades:
+break
+all_trades.extend(insider_trades)
+if not start_date or len(insider_trades) < limit:
+break
+current_end_date = min(trade.filing_date for trade in insider_trades).split('T')[0]
+if current_end_date <= start_date:
+break
+if not all_trades:
+return []
+_cache.set_insider_trades(ticker, [trade.model_dump() for trade in all_trades])
+return all_trades
+def get_company_news(
+ticker: str,
+end_date: str,
+start_date: str | None = None,
+limit: int = 1000,
+) -> list[CompanyNews]:
+if cached_data := _cache.get_company_news(ticker):
+filtered_data = [CompanyNews(**news) for news in cached_data
+if (start_date is None or news["date"] >= start_date)
+and news["date"] <= end_date]
+filtered_data.sort(key=lambda x: x.date, reverse=True)
+if filtered_data:
+return filtered_data
+headers = {}
+if api_key := os.environ.get("FINANCIAL_DATASETS_API_KEY"):
+headers["X-API-KEY"] = api_key
+all_news = []
+current_end_date = end_date
+while True:
+url = f"https://api.financialdatasets.ai/news/?ticker={ticker}&end_date={current_end_date}"
+if start_date:
+url += f"&start_date={start_date}"
+url += f"&limit={limit}"
+response = requests.get(url, headers=headers)
+if response.status_code != 200:
+raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
+data = response.json()
+response_model = CompanyNewsResponse(**data)
+company_news = response_model.news
+if not company_news:
+break
+all_news.extend(company_news)
+if not start_date or len(company_news) < limit:
+break
+current_end_date = min(news.date for news in company_news).split('T')[0]
+if current_end_date <= start_date:
+break
+if not all_news:
+return []
+_cache.set_company_news(ticker, [news.model_dump() for news in all_news])
+return all_news
+def get_market_cap(
+ticker: str,
+end_date: str,
+) -> float | None:
+financial_metrics = get_financial_metrics(ticker, end_date)
+market_cap = financial_metrics[0].market_cap
+if not market_cap:
+return None
+return market_cap
+def prices_to_df(prices: list[Price]) -> pd.DataFrame:
+df = pd.DataFrame([p.model_dump() for p in prices])
+df["Date"] = pd.to_datetime(df["time"])
+df.set_index("Date", inplace=True)
+numeric_cols = ["open", "close", "high", "low", "volume"]
+for col in numeric_cols:
+df[col] = pd.to_numeric(df[col], errors="coerce")
+df.sort_index(inplace=True)
+return df
+def get_price_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+prices = get_prices(ticker, start_date, end_date)
+return prices_to_df(prices)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/llm/models.py
+import os
+from langchain_anthropic import ChatAnthropic
+from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
+from enum import Enum
+from pydantic import BaseModel
+from typing import Tuple
+class ModelProvider(str, Enum):
+OPENAI = "OpenAI"
+GROQ = "Groq"
+ANTHROPIC = "Anthropic"
+class LLMModel(BaseModel):
+display_name: str
+model_name: str
+provider: ModelProvider
+def to_choice_tuple(self) -> Tuple[str, str, str]:
+return (self.display_name, self.model_name, self.provider.value)
+def is_deepseek(self) -> bool:
+return self.model_name.startswith("deepseek")
+AVAILABLE_MODELS = [
+LLMModel(
+display_name="[anthropic] claude-3.5-haiku",
+model_name="claude-3-5-haiku-latest",
+provider=ModelProvider.ANTHROPIC
+),
+LLMModel(
+display_name="[anthropic] claude-3.5-sonnet",
+model_name="claude-3-5-sonnet-latest",
+provider=ModelProvider.ANTHROPIC
+),
+LLMModel(
+display_name="[anthropic] claude-3.7-sonnet",
+model_name="claude-3-7-sonnet-latest",
+provider=ModelProvider.ANTHROPIC
+),
+LLMModel(
+display_name="[groq] deepseek-r1 70b",
+model_name="deepseek-r1-distill-llama-70b",
+provider=ModelProvider.GROQ
+),
+LLMModel(
+display_name="[groq] llama-3.3 70b",
+model_name="llama-3.3-70b-versatile",
+provider=ModelProvider.GROQ
+),
+LLMModel(
+display_name="[openai] gpt-4o",
+model_name="gpt-4o",
+provider=ModelProvider.OPENAI
+),
+LLMModel(
+display_name="[openai] gpt-4o-mini",
+model_name="gpt-4o-mini",
+provider=ModelProvider.OPENAI
+),
+LLMModel(
+display_name="[openai] o1",
+model_name="o1",
+provider=ModelProvider.OPENAI
+),
+LLMModel(
+display_name="[openai] o3-mini",
+model_name="o3-mini",
+provider=ModelProvider.OPENAI
+),
+]
+LLM_ORDER = [model.to_choice_tuple() for model in AVAILABLE_MODELS]
+def get_model_info(model_name: str) -> LLMModel | None:
+return next((model for model in AVAILABLE_MODELS if model.model_name == model_name), None)
+def get_model(model_name: str, model_provider: ModelProvider) -> ChatOpenAI | ChatGroq | None:
+if model_provider == ModelProvider.GROQ:
+api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+print(f"API Key Error: Please make sure GROQ_API_KEY is set in your .env file.")
+raise ValueError("Groq API key not found.  Please make sure GROQ_API_KEY is set in your .env file.")
+return ChatGroq(model=model_name, api_key=api_key)
+elif model_provider == ModelProvider.OPENAI:
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+print(f"API Key Error: Please make sure OPENAI_API_KEY is set in your .env file.")
+raise ValueError("OpenAI API key not found.  Please make sure OPENAI_API_KEY is set in your .env file.")
+return ChatOpenAI(model=model_name, api_key=api_key)
+elif model_provider == ModelProvider.ANTHROPIC:
+api_key = os.getenv("ANTHROPIC_API_KEY")
+if not api_key:
+print(f"API Key Error: Please make sure ANTHROPIC_API_KEY is set in your .env file.")
+raise ValueError("Anthropic API key not found.  Please make sure ANTHROPIC_API_KEY is set in your .env file.")
+return ChatAnthropic(model=model_name, api_key=api_key)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/graph/state.py
+from typing_extensions import Annotated, Sequence, TypedDict
+import operator
+from langchain_core.messages import BaseMessage
+import json
+def merge_dicts(a: dict[str, any], b: dict[str, any]) -> dict[str, any]:
+return {**a, **b}
+class AgentState(TypedDict):
+messages: Annotated[Sequence[BaseMessage], operator.add]
+data: Annotated[dict[str, any], merge_dicts]
+metadata: Annotated[dict[str, any], merge_dicts]
+def show_agent_reasoning(output, agent_name):
+print(f"\n{'=' * 10} {agent_name.center(28)} {'=' * 10}")
+def convert_to_serializable(obj):
+if hasattr(obj, "to_dict"):
+return obj.to_dict()
+elif hasattr(obj, "__dict__"):
+return obj.__dict__
+elif isinstance(obj, (int, float, bool, str)):
+return obj
+elif isinstance(obj, (list, tuple)):
+return [convert_to_serializable(item) for item in obj]
+elif isinstance(obj, dict):
+return {key: convert_to_serializable(value) for key, value in obj.items()}
+else:
+return str(obj)
+if isinstance(output, (dict, list)):
+serializable_output = convert_to_serializable(output)
+print(json.dumps(serializable_output, indent=2))
+else:
+try:
+parsed_output = json.loads(output)
+print(json.dumps(parsed_output, indent=2))
+except json.JSONDecodeError:
+print(output)
+print("=" * 48)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/warren_buffett.py
+from graph.state import AgentState, show_agent_reasoning
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+import json
+from typing_extensions import Literal
+from tools.api import get_financial_metrics, get_market_cap, search_line_items
+from utils.llm import call_llm
+from utils.progress import progress
+class WarrenBuffettSignal(BaseModel):
+signal: Literal["bullish", "bearish", "neutral"]
+confidence: float
+reasoning: str
+def warren_buffett_agent(state: AgentState):
+data = state["data"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+analysis_data = {}
+buffett_analysis = {}
+for ticker in tickers:
+progress.update_status("warren_buffett_agent", ticker, "Fetching financial metrics")
+metrics = get_financial_metrics(ticker, end_date, period="ttm", limit=5)
+progress.update_status("warren_buffett_agent", ticker, "Gathering financial line items")
+financial_line_items = search_line_items(
+ticker,
+[
+"capital_expenditure",
+"depreciation_and_amortization",
+"net_income",
+"outstanding_shares",
+"total_assets",
+"total_liabilities",
+],
+end_date,
+period="ttm",
+limit=5,
+)
+progress.update_status("warren_buffett_agent", ticker, "Getting market cap")
+market_cap = get_market_cap(ticker, end_date)
+progress.update_status("warren_buffett_agent", ticker, "Analyzing fundamentals")
+fundamental_analysis = analyze_fundamentals(metrics)
+progress.update_status("warren_buffett_agent", ticker, "Analyzing consistency")
+consistency_analysis = analyze_consistency(financial_line_items)
+progress.update_status("warren_buffett_agent", ticker, "Calculating intrinsic value")
+intrinsic_value_analysis = calculate_intrinsic_value(financial_line_items)
+total_score = fundamental_analysis["score"] + consistency_analysis["score"]
+max_possible_score = 10
+margin_of_safety = None
+intrinsic_value = intrinsic_value_analysis["intrinsic_value"]
+if intrinsic_value and market_cap:
+margin_of_safety = (intrinsic_value - market_cap) / market_cap
+if margin_of_safety > 0.3:
+total_score += 2
+max_possible_score += 2
+if total_score >= 0.7 * max_possible_score:
+signal = "bullish"
+elif total_score <= 0.3 * max_possible_score:
+signal = "bearish"
+else:
+signal = "neutral"
+analysis_data[ticker] = {
+"signal": signal,
+"score": total_score,
+"max_score": max_possible_score,
+"fundamental_analysis": fundamental_analysis,
+"consistency_analysis": consistency_analysis,
+"intrinsic_value_analysis": intrinsic_value_analysis,
+"market_cap": market_cap,
+"margin_of_safety": margin_of_safety,
+}
+progress.update_status("warren_buffett_agent", ticker, "Generating Buffett analysis")
+buffett_output = generate_buffett_output(
+ticker=ticker,
+analysis_data=analysis_data,
+model_name=state["metadata"]["model_name"],
+model_provider=state["metadata"]["model_provider"],
+)
+buffett_analysis[ticker] = {
+"signal": buffett_output.signal,
+"confidence": buffett_output.confidence,
+"reasoning": buffett_output.reasoning,
+}
+progress.update_status("warren_buffett_agent", ticker, "Done")
+message = HumanMessage(content=json.dumps(buffett_analysis), name="warren_buffett_agent")
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(buffett_analysis, "Warren Buffett Agent")
+state["data"]["analyst_signals"]["warren_buffett_agent"] = buffett_analysis
+return {"messages": [message], "data": state["data"]}
+def analyze_fundamentals(metrics: list) -> dict[str, any]:
+if not metrics:
+return {"score": 0, "details": "Insufficient fundamental data"}
+latest_metrics = metrics[0]
+score = 0
+reasoning = []
+if latest_metrics.return_on_equity and latest_metrics.return_on_equity > 0.15:
+score += 2
+reasoning.append(f"Strong ROE of {latest_metrics.return_on_equity:.1%}")
+elif latest_metrics.return_on_equity:
+reasoning.append(f"Weak ROE of {latest_metrics.return_on_equity:.1%}")
+else:
+reasoning.append("ROE data not available")
+if latest_metrics.debt_to_equity and latest_metrics.debt_to_equity < 0.5:
+score += 2
+reasoning.append("Conservative debt levels")
+elif latest_metrics.debt_to_equity:
+reasoning.append(f"High debt to equity ratio of {latest_metrics.debt_to_equity:.1f}")
+else:
+reasoning.append("Debt to equity data not available")
+if latest_metrics.operating_margin and latest_metrics.operating_margin > 0.15:
+score += 2
+reasoning.append("Strong operating margins")
+elif latest_metrics.operating_margin:
+reasoning.append(f"Weak operating margin of {latest_metrics.operating_margin:.1%}")
+else:
+reasoning.append("Operating margin data not available")
+if latest_metrics.current_ratio and latest_metrics.current_ratio > 1.5:
+score += 1
+reasoning.append("Good liquidity position")
+elif latest_metrics.current_ratio:
+reasoning.append(f"Weak liquidity with current ratio of {latest_metrics.current_ratio:.1f}")
+else:
+reasoning.append("Current ratio data not available")
+return {"score": score, "details": "; ".join(reasoning), "metrics": latest_metrics.model_dump()}
+def analyze_consistency(financial_line_items: list) -> dict[str, any]:
+if len(financial_line_items) < 4:
+return {"score": 0, "details": "Insufficient historical data"}
+score = 0
+reasoning = []
+earnings_values = [item.net_income for item in financial_line_items if item.net_income]
+if len(earnings_values) >= 4:
+earnings_growth = all(earnings_values[i] > earnings_values[i + 1] for i in range(len(earnings_values) - 1))
+if earnings_growth:
+score += 3
+reasoning.append("Consistent earnings growth over past periods")
+else:
+reasoning.append("Inconsistent earnings growth pattern")
+if len(earnings_values) >= 2:
+growth_rate = (earnings_values[0] - earnings_values[-1]) / abs(earnings_values[-1])
+reasoning.append(f"Total earnings growth of {growth_rate:.1%} over past {len(earnings_values)} periods")
+else:
+reasoning.append("Insufficient earnings data for trend analysis")
+return {
+"score": score,
+"details": "; ".join(reasoning),
+}
+def calculate_owner_earnings(financial_line_items: list) -> dict[str, any]:
+if not financial_line_items or len(financial_line_items) < 1:
+return {"owner_earnings": None, "details": ["Insufficient data for owner earnings calculation"]}
+latest = financial_line_items[0]
+net_income = latest.net_income
+depreciation = latest.depreciation_and_amortization
+capex = latest.capital_expenditure
+if not all([net_income, depreciation, capex]):
+return {"owner_earnings": None, "details": ["Missing components for owner earnings calculation"]}
+maintenance_capex = capex * 0.75
+owner_earnings = net_income + depreciation - maintenance_capex
+return {
+"owner_earnings": owner_earnings,
+"components": {"net_income": net_income, "depreciation": depreciation, "maintenance_capex": maintenance_capex},
+"details": ["Owner earnings calculated successfully"],
+}
+def calculate_intrinsic_value(financial_line_items: list) -> dict[str, any]:
+if not financial_line_items:
+return {"value": None, "details": ["Insufficient data for valuation"]}
+earnings_data = calculate_owner_earnings(financial_line_items)
+if not earnings_data["owner_earnings"]:
+return {"value": None, "details": earnings_data["details"]}
+owner_earnings = earnings_data["owner_earnings"]
+latest_financial_line_items = financial_line_items[0]
+shares_outstanding = latest_financial_line_items.outstanding_shares
+if not shares_outstanding:
+return {"value": None, "details": ["Missing shares outstanding data"]}
+growth_rate = 0.05
+discount_rate = 0.09
+terminal_multiple = 12
+projection_years = 10
+future_value = 0
+for year in range(1, projection_years + 1):
+future_earnings = owner_earnings * (1 + growth_rate) ** year
+present_value = future_earnings / (1 + discount_rate) ** year
+future_value += present_value
+terminal_value = (owner_earnings * (1 + growth_rate) ** projection_years * terminal_multiple) / (1 + discount_rate) ** projection_years
+intrinsic_value = future_value + terminal_value
+return {
+"intrinsic_value": intrinsic_value,
+"owner_earnings": owner_earnings,
+"assumptions": {
+"growth_rate": growth_rate,
+"discount_rate": discount_rate,
+"terminal_multiple": terminal_multiple,
+"projection_years": projection_years,
+},
+"details": ["Intrinsic value calculated using DCF model with owner earnings"],
+}
+def generate_buffett_output(
+ticker: str,
+analysis_data: dict[str, any],
+model_name: str,
+model_provider: str,
+) -> WarrenBuffettSignal:
+template = ChatPromptTemplate.from_messages(
+[
+(
+"system",
+,
+),
+(
+"human",
+,
+),
+]
+)
+prompt = template.invoke({
+"analysis_data": json.dumps(analysis_data, indent=2),
+"ticker": ticker
+})
+def create_default_warren_buffett_signal():
+return WarrenBuffettSignal(signal="neutral", confidence=0.0, reasoning="Error in analysis, defaulting to neutral")
+return call_llm(
+prompt=prompt,
+model_name=model_name,
+model_provider=model_provider,
+pydantic_model=WarrenBuffettSignal,
+agent_name="warren_buffett_agent",
+default_factory=create_default_warren_buffett_signal,
+)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/sentiment.py
+from langchain_core.messages import HumanMessage
+from graph.state import AgentState, show_agent_reasoning
+from utils.progress import progress
+import pandas as pd
+import numpy as np
+import json
+from tools.api import get_insider_trades, get_company_news
+def sentiment_agent(state: AgentState):
+data = state.get("data", {})
+end_date = data.get("end_date")
+tickers = data.get("tickers")
+sentiment_analysis = {}
+for ticker in tickers:
+progress.update_status("sentiment_agent", ticker, "Fetching insider trades")
+insider_trades = get_insider_trades(
+ticker=ticker,
+end_date=end_date,
+limit=1000,
+)
+progress.update_status("sentiment_agent", ticker, "Analyzing trading patterns")
+transaction_shares = pd.Series([t.transaction_shares for t in insider_trades]).dropna()
+insider_signals = np.where(transaction_shares < 0, "bearish", "bullish").tolist()
+progress.update_status("sentiment_agent", ticker, "Fetching company news")
+company_news = get_company_news(ticker, end_date, limit=100)
+sentiment = pd.Series([n.sentiment for n in company_news]).dropna()
+news_signals = np.where(sentiment == "negative", "bearish",
+np.where(sentiment == "positive", "bullish", "neutral")).tolist()
+progress.update_status("sentiment_agent", ticker, "Combining signals")
+insider_weight = 0.3
+news_weight = 0.7
+bullish_signals = (
+insider_signals.count("bullish") * insider_weight +
+news_signals.count("bullish") * news_weight
+)
+bearish_signals = (
+insider_signals.count("bearish") * insider_weight +
+news_signals.count("bearish") * news_weight
+)
+if bullish_signals > bearish_signals:
+overall_signal = "bullish"
+elif bearish_signals > bullish_signals:
+overall_signal = "bearish"
+else:
+overall_signal = "neutral"
+total_weighted_signals = len(insider_signals) * insider_weight + len(news_signals) * news_weight
+confidence = 0
+if total_weighted_signals > 0:
+confidence = round(max(bullish_signals, bearish_signals) / total_weighted_signals, 2) * 100
+reasoning = f"Weighted Bullish signals: {bullish_signals:.1f}, Weighted Bearish signals: {bearish_signals:.1f}"
+sentiment_analysis[ticker] = {
+"signal": overall_signal,
+"confidence": confidence,
+"reasoning": reasoning,
+}
+progress.update_status("sentiment_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(sentiment_analysis),
+name="sentiment_agent",
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(sentiment_analysis, "Sentiment Analysis Agent")
+state["data"]["analyst_signals"]["sentiment_agent"] = sentiment_analysis
+return {
+"messages": [message],
+"data": data,
+}
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/fundamentals.py
+from langchain_core.messages import HumanMessage
+from graph.state import AgentState, show_agent_reasoning
+from utils.progress import progress
+import json
+from tools.api import get_financial_metrics
+def fundamentals_agent(state: AgentState):
+data = state["data"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+fundamental_analysis = {}
+for ticker in tickers:
+progress.update_status("fundamentals_agent", ticker, "Fetching financial metrics")
+financial_metrics = get_financial_metrics(
+ticker=ticker,
+end_date=end_date,
+period="ttm",
+limit=10,
+)
+if not financial_metrics:
+progress.update_status("fundamentals_agent", ticker, "Failed: No financial metrics found")
+continue
+metrics = financial_metrics[0]
+signals = []
+reasoning = {}
+progress.update_status("fundamentals_agent", ticker, "Analyzing profitability")
+return_on_equity = metrics.return_on_equity
+net_margin = metrics.net_margin
+operating_margin = metrics.operating_margin
+thresholds = [
+(return_on_equity, 0.15),
+(net_margin, 0.20),
+(operating_margin, 0.15),
+]
+profitability_score = sum(metric is not None and metric > threshold for metric, threshold in thresholds)
+signals.append("bullish" if profitability_score >= 2 else "bearish" if profitability_score == 0 else "neutral")
+reasoning["profitability_signal"] = {
+"signal": signals[0],
+"details": (f"ROE: {return_on_equity:.2%}" if return_on_equity else "ROE: N/A") + ", " + (f"Net Margin: {net_margin:.2%}" if net_margin else "Net Margin: N/A") + ", " + (f"Op Margin: {operating_margin:.2%}" if operating_margin else "Op Margin: N/A"),
+}
+progress.update_status("fundamentals_agent", ticker, "Analyzing growth")
+revenue_growth = metrics.revenue_growth
+earnings_growth = metrics.earnings_growth
+book_value_growth = metrics.book_value_growth
+thresholds = [
+(revenue_growth, 0.10),
+(earnings_growth, 0.10),
+(book_value_growth, 0.10),
+]
+growth_score = sum(metric is not None and metric > threshold for metric, threshold in thresholds)
+signals.append("bullish" if growth_score >= 2 else "bearish" if growth_score == 0 else "neutral")
+reasoning["growth_signal"] = {
+"signal": signals[1],
+"details": (f"Revenue Growth: {revenue_growth:.2%}" if revenue_growth else "Revenue Growth: N/A") + ", " + (f"Earnings Growth: {earnings_growth:.2%}" if earnings_growth else "Earnings Growth: N/A"),
+}
+progress.update_status("fundamentals_agent", ticker, "Analyzing financial health")
+current_ratio = metrics.current_ratio
+debt_to_equity = metrics.debt_to_equity
+free_cash_flow_per_share = metrics.free_cash_flow_per_share
+earnings_per_share = metrics.earnings_per_share
+health_score = 0
+if current_ratio and current_ratio > 1.5:
+health_score += 1
+if debt_to_equity and debt_to_equity < 0.5:
+health_score += 1
+if free_cash_flow_per_share and earnings_per_share and free_cash_flow_per_share > earnings_per_share * 0.8:
+health_score += 1
+signals.append("bullish" if health_score >= 2 else "bearish" if health_score == 0 else "neutral")
+reasoning["financial_health_signal"] = {
+"signal": signals[2],
+"details": (f"Current Ratio: {current_ratio:.2f}" if current_ratio else "Current Ratio: N/A") + ", " + (f"D/E: {debt_to_equity:.2f}" if debt_to_equity else "D/E: N/A"),
+}
+progress.update_status("fundamentals_agent", ticker, "Analyzing valuation ratios")
+pe_ratio = metrics.price_to_earnings_ratio
+pb_ratio = metrics.price_to_book_ratio
+ps_ratio = metrics.price_to_sales_ratio
+thresholds = [
+(pe_ratio, 25),
+(pb_ratio, 3),
+(ps_ratio, 5),
+]
+price_ratio_score = sum(metric is not None and metric > threshold for metric, threshold in thresholds)
+signals.append("bullish" if price_ratio_score >= 2 else "bearish" if price_ratio_score == 0 else "neutral")
+reasoning["price_ratios_signal"] = {
+"signal": signals[3],
+"details": (f"P/E: {pe_ratio:.2f}" if pe_ratio else "P/E: N/A") + ", " + (f"P/B: {pb_ratio:.2f}" if pb_ratio else "P/B: N/A") + ", " + (f"P/S: {ps_ratio:.2f}" if ps_ratio else "P/S: N/A"),
+}
+progress.update_status("fundamentals_agent", ticker, "Calculating final signal")
+bullish_signals = signals.count("bullish")
+bearish_signals = signals.count("bearish")
+if bullish_signals > bearish_signals:
+overall_signal = "bullish"
+elif bearish_signals > bullish_signals:
+overall_signal = "bearish"
+else:
+overall_signal = "neutral"
+total_signals = len(signals)
+confidence = round(max(bullish_signals, bearish_signals) / total_signals, 2) * 100
+fundamental_analysis[ticker] = {
+"signal": overall_signal,
+"confidence": confidence,
+"reasoning": reasoning,
+}
+progress.update_status("fundamentals_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(fundamental_analysis),
+name="fundamentals_agent",
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(fundamental_analysis, "Fundamental Analysis Agent")
+state["data"]["analyst_signals"]["fundamentals_agent"] = fundamental_analysis
+return {
+"messages": [message],
+"data": data,
+}
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/technicals.py
+import math
+from langchain_core.messages import HumanMessage
+from graph.state import AgentState, show_agent_reasoning
+import json
+import pandas as pd
+import numpy as np
+from tools.api import get_prices, prices_to_df
+from utils.progress import progress
+def technical_analyst_agent(state: AgentState):
+data = state["data"]
+start_date = data["start_date"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+technical_analysis = {}
+for ticker in tickers:
+progress.update_status("technical_analyst_agent", ticker, "Analyzing price data")
+prices = get_prices(
+ticker=ticker,
+start_date=start_date,
+end_date=end_date,
+)
+if not prices:
+progress.update_status("technical_analyst_agent", ticker, "Failed: No price data found")
+continue
+prices_df = prices_to_df(prices)
+progress.update_status("technical_analyst_agent", ticker, "Calculating trend signals")
+trend_signals = calculate_trend_signals(prices_df)
+progress.update_status("technical_analyst_agent", ticker, "Calculating mean reversion")
+mean_reversion_signals = calculate_mean_reversion_signals(prices_df)
+progress.update_status("technical_analyst_agent", ticker, "Calculating momentum")
+momentum_signals = calculate_momentum_signals(prices_df)
+progress.update_status("technical_analyst_agent", ticker, "Analyzing volatility")
+volatility_signals = calculate_volatility_signals(prices_df)
+progress.update_status("technical_analyst_agent", ticker, "Statistical analysis")
+stat_arb_signals = calculate_stat_arb_signals(prices_df)
+strategy_weights = {
+"trend": 0.25,
+"mean_reversion": 0.20,
+"momentum": 0.25,
+"volatility": 0.15,
+"stat_arb": 0.15,
+}
+progress.update_status("technical_analyst_agent", ticker, "Combining signals")
+combined_signal = weighted_signal_combination(
+{
+"trend": trend_signals,
+"mean_reversion": mean_reversion_signals,
+"momentum": momentum_signals,
+"volatility": volatility_signals,
+"stat_arb": stat_arb_signals,
+},
+strategy_weights,
+)
+technical_analysis[ticker] = {
+"signal": combined_signal["signal"],
+"confidence": round(combined_signal["confidence"] * 100),
+"strategy_signals": {
+"trend_following": {
+"signal": trend_signals["signal"],
+"confidence": round(trend_signals["confidence"] * 100),
+"metrics": normalize_pandas(trend_signals["metrics"]),
+},
+"mean_reversion": {
+"signal": mean_reversion_signals["signal"],
+"confidence": round(mean_reversion_signals["confidence"] * 100),
+"metrics": normalize_pandas(mean_reversion_signals["metrics"]),
+},
+"momentum": {
+"signal": momentum_signals["signal"],
+"confidence": round(momentum_signals["confidence"] * 100),
+"metrics": normalize_pandas(momentum_signals["metrics"]),
+},
+"volatility": {
+"signal": volatility_signals["signal"],
+"confidence": round(volatility_signals["confidence"] * 100),
+"metrics": normalize_pandas(volatility_signals["metrics"]),
+},
+"statistical_arbitrage": {
+"signal": stat_arb_signals["signal"],
+"confidence": round(stat_arb_signals["confidence"] * 100),
+"metrics": normalize_pandas(stat_arb_signals["metrics"]),
+},
+},
+}
+progress.update_status("technical_analyst_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(technical_analysis),
+name="technical_analyst_agent",
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(technical_analysis, "Technical Analyst")
+state["data"]["analyst_signals"]["technical_analyst_agent"] = technical_analysis
+return {
+"messages": state["messages"] + [message],
+"data": data,
+}
+def calculate_trend_signals(prices_df):
+ema_8 = calculate_ema(prices_df, 8)
+ema_21 = calculate_ema(prices_df, 21)
+ema_55 = calculate_ema(prices_df, 55)
+adx = calculate_adx(prices_df, 14)
+short_trend = ema_8 > ema_21
+medium_trend = ema_21 > ema_55
+trend_strength = adx["adx"].iloc[-1] / 100.0
+if short_trend.iloc[-1] and medium_trend.iloc[-1]:
+signal = "bullish"
+confidence = trend_strength
+elif not short_trend.iloc[-1] and not medium_trend.iloc[-1]:
+signal = "bearish"
+confidence = trend_strength
+else:
+signal = "neutral"
+confidence = 0.5
+return {
+"signal": signal,
+"confidence": confidence,
+"metrics": {
+"adx": float(adx["adx"].iloc[-1]),
+"trend_strength": float(trend_strength),
+},
+}
+def calculate_mean_reversion_signals(prices_df):
+ma_50 = prices_df["close"].rolling(window=50).mean()
+std_50 = prices_df["close"].rolling(window=50).std()
+z_score = (prices_df["close"] - ma_50) / std_50
+bb_upper, bb_lower = calculate_bollinger_bands(prices_df)
+rsi_14 = calculate_rsi(prices_df, 14)
+rsi_28 = calculate_rsi(prices_df, 28)
+price_vs_bb = (prices_df["close"].iloc[-1] - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1])
+if z_score.iloc[-1] < -2 and price_vs_bb < 0.2:
+signal = "bullish"
+confidence = min(abs(z_score.iloc[-1]) / 4, 1.0)
+elif z_score.iloc[-1] > 2 and price_vs_bb > 0.8:
+signal = "bearish"
+confidence = min(abs(z_score.iloc[-1]) / 4, 1.0)
+else:
+signal = "neutral"
+confidence = 0.5
+return {
+"signal": signal,
+"confidence": confidence,
+"metrics": {
+"z_score": float(z_score.iloc[-1]),
+"price_vs_bb": float(price_vs_bb),
+"rsi_14": float(rsi_14.iloc[-1]),
+"rsi_28": float(rsi_28.iloc[-1]),
+},
+}
+def calculate_momentum_signals(prices_df):
+returns = prices_df["close"].pct_change()
+mom_1m = returns.rolling(21).sum()
+mom_3m = returns.rolling(63).sum()
+mom_6m = returns.rolling(126).sum()
+volume_ma = prices_df["volume"].rolling(21).mean()
+volume_momentum = prices_df["volume"] / volume_ma
+momentum_score = (0.4 * mom_1m + 0.3 * mom_3m + 0.3 * mom_6m).iloc[-1]
+volume_confirmation = volume_momentum.iloc[-1] > 1.0
+if momentum_score > 0.05 and volume_confirmation:
+signal = "bullish"
+confidence = min(abs(momentum_score) * 5, 1.0)
+elif momentum_score < -0.05 and volume_confirmation:
+signal = "bearish"
+confidence = min(abs(momentum_score) * 5, 1.0)
+else:
+signal = "neutral"
+confidence = 0.5
+return {
+"signal": signal,
+"confidence": confidence,
+"metrics": {
+"momentum_1m": float(mom_1m.iloc[-1]),
+"momentum_3m": float(mom_3m.iloc[-1]),
+"momentum_6m": float(mom_6m.iloc[-1]),
+"volume_momentum": float(volume_momentum.iloc[-1]),
+},
+}
+def calculate_volatility_signals(prices_df):
+returns = prices_df["close"].pct_change()
+hist_vol = returns.rolling(21).std() * math.sqrt(252)
+vol_ma = hist_vol.rolling(63).mean()
+vol_regime = hist_vol / vol_ma
+vol_z_score = (hist_vol - vol_ma) / hist_vol.rolling(63).std()
+atr = calculate_atr(prices_df)
+atr_ratio = atr / prices_df["close"]
+current_vol_regime = vol_regime.iloc[-1]
+vol_z = vol_z_score.iloc[-1]
+if current_vol_regime < 0.8 and vol_z < -1:
+signal = "bullish"
+confidence = min(abs(vol_z) / 3, 1.0)
+elif current_vol_regime > 1.2 and vol_z > 1:
+signal = "bearish"
+confidence = min(abs(vol_z) / 3, 1.0)
+else:
+signal = "neutral"
+confidence = 0.5
+return {
+"signal": signal,
+"confidence": confidence,
+"metrics": {
+"historical_volatility": float(hist_vol.iloc[-1]),
+"volatility_regime": float(current_vol_regime),
+"volatility_z_score": float(vol_z),
+"atr_ratio": float(atr_ratio.iloc[-1]),
+},
+}
+def calculate_stat_arb_signals(prices_df):
+returns = prices_df["close"].pct_change()
+skew = returns.rolling(63).skew()
+kurt = returns.rolling(63).kurt()
+hurst = calculate_hurst_exponent(prices_df["close"])
+if hurst < 0.4 and skew.iloc[-1] > 1:
+signal = "bullish"
+confidence = (0.5 - hurst) * 2
+elif hurst < 0.4 and skew.iloc[-1] < -1:
+signal = "bearish"
+confidence = (0.5 - hurst) * 2
+else:
+signal = "neutral"
+confidence = 0.5
+return {
+"signal": signal,
+"confidence": confidence,
+"metrics": {
+"hurst_exponent": float(hurst),
+"skewness": float(skew.iloc[-1]),
+"kurtosis": float(kurt.iloc[-1]),
+},
+}
+def weighted_signal_combination(signals, weights):
+signal_values = {"bullish": 1, "neutral": 0, "bearish": -1}
+weighted_sum = 0
+total_confidence = 0
+for strategy, signal in signals.items():
+numeric_signal = signal_values[signal["signal"]]
+weight = weights[strategy]
+confidence = signal["confidence"]
+weighted_sum += numeric_signal * weight * confidence
+total_confidence += weight * confidence
+if total_confidence > 0:
+final_score = weighted_sum / total_confidence
+else:
+final_score = 0
+if final_score > 0.2:
+signal = "bullish"
+elif final_score < -0.2:
+signal = "bearish"
+else:
+signal = "neutral"
+return {"signal": signal, "confidence": abs(final_score)}
+def normalize_pandas(obj):
+if isinstance(obj, pd.Series):
+return obj.tolist()
+elif isinstance(obj, pd.DataFrame):
+return obj.to_dict("records")
+elif isinstance(obj, dict):
+return {k: normalize_pandas(v) for k, v in obj.items()}
+elif isinstance(obj, (list, tuple)):
+return [normalize_pandas(item) for item in obj]
+return obj
+def calculate_rsi(prices_df: pd.DataFrame, period: int = 14) -> pd.Series:
+delta = prices_df["close"].diff()
+gain = (delta.where(delta > 0, 0)).fillna(0)
+loss = (-delta.where(delta < 0, 0)).fillna(0)
+avg_gain = gain.rolling(window=period).mean()
+avg_loss = loss.rolling(window=period).mean()
+rs = avg_gain / avg_loss
+rsi = 100 - (100 / (1 + rs))
+return rsi
+def calculate_bollinger_bands(prices_df: pd.DataFrame, window: int = 20) -> tuple[pd.Series, pd.Series]:
+sma = prices_df["close"].rolling(window).mean()
+std_dev = prices_df["close"].rolling(window).std()
+upper_band = sma + (std_dev * 2)
+lower_band = sma - (std_dev * 2)
+return upper_band, lower_band
+def calculate_ema(df: pd.DataFrame, window: int) -> pd.Series:
+return df["close"].ewm(span=window, adjust=False).mean()
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+df["high_low"] = df["high"] - df["low"]
+df["high_close"] = abs(df["high"] - df["close"].shift())
+df["low_close"] = abs(df["low"] - df["close"].shift())
+df["tr"] = df[["high_low", "high_close", "low_close"]].max(axis=1)
+df["up_move"] = df["high"] - df["high"].shift()
+df["down_move"] = df["low"].shift() - df["low"]
+df["plus_dm"] = np.where((df["up_move"] > df["down_move"]) & (df["up_move"] > 0), df["up_move"], 0)
+df["minus_dm"] = np.where((df["down_move"] > df["up_move"]) & (df["down_move"] > 0), df["down_move"], 0)
+df["+di"] = 100 * (df["plus_dm"].ewm(span=period).mean() / df["tr"].ewm(span=period).mean())
+df["-di"] = 100 * (df["minus_dm"].ewm(span=period).mean() / df["tr"].ewm(span=period).mean())
+df["dx"] = 100 * abs(df["+di"] - df["-di"]) / (df["+di"] + df["-di"])
+df["adx"] = df["dx"].ewm(span=period).mean()
+return df[["adx", "+di", "-di"]]
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+high_low = df["high"] - df["low"]
+high_close = abs(df["high"] - df["close"].shift())
+low_close = abs(df["low"] - df["close"].shift())
+ranges = pd.concat([high_low, high_close, low_close], axis=1)
+true_range = ranges.max(axis=1)
+return true_range.rolling(period).mean()
+def calculate_hurst_exponent(price_series: pd.Series, max_lag: int = 20) -> float:
+lags = range(2, max_lag)
+tau = [max(1e-8, np.sqrt(np.std(np.subtract(price_series[lag:], price_series[:-lag])))) for lag in lags]
+try:
+reg = np.polyfit(np.log(lags), np.log(tau), 1)
+return reg[0]
+except (ValueError, RuntimeWarning):
+return 0.5
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/cathie_wood.py
+from langchain_openai import ChatOpenAI
+from graph.state import AgentState, show_agent_reasoning
+from tools.api import get_financial_metrics, get_market_cap, search_line_items
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+import json
+from typing_extensions import Literal
+from utils.progress import progress
+from utils.llm import call_llm
+class CathieWoodSignal(BaseModel):
+signal: Literal["bullish", "bearish", "neutral"]
+confidence: float
+reasoning: str
+def cathie_wood_agent(state: AgentState):
+data = state["data"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+analysis_data = {}
+cw_analysis = {}
+for ticker in tickers:
+progress.update_status("cathie_wood_agent", ticker, "Fetching financial metrics")
+metrics = get_financial_metrics(ticker, end_date, period="annual", limit=5)
+progress.update_status("cathie_wood_agent", ticker, "Gathering financial line items")
+financial_line_items = search_line_items(
+ticker,
+[
+"revenue",
+"gross_margin",
+"operating_margin",
+"debt_to_equity",
+"free_cash_flow",
+"total_assets",
+"total_liabilities",
+"dividends_and_other_cash_distributions",
+"outstanding_shares",
+"research_and_development",
+"capital_expenditure",
+"operating_expense",
+],
+end_date,
+period="annual",
+limit=5
+)
+progress.update_status("cathie_wood_agent", ticker, "Getting market cap")
+market_cap = get_market_cap(ticker, end_date)
+progress.update_status("cathie_wood_agent", ticker, "Analyzing disruptive potential")
+disruptive_analysis = analyze_disruptive_potential(metrics, financial_line_items)
+progress.update_status("cathie_wood_agent", ticker, "Analyzing innovation-driven growth")
+innovation_analysis = analyze_innovation_growth(metrics, financial_line_items)
+progress.update_status("cathie_wood_agent", ticker, "Calculating valuation & high-growth scenario")
+valuation_analysis = analyze_cathie_wood_valuation(financial_line_items, market_cap)
+total_score = disruptive_analysis["score"] + innovation_analysis["score"] + valuation_analysis["score"]
+max_possible_score = 15
+if total_score >= 0.7 * max_possible_score:
+signal = "bullish"
+elif total_score <= 0.3 * max_possible_score:
+signal = "bearish"
+else:
+signal = "neutral"
+analysis_data[ticker] = {
+"signal": signal,
+"score": total_score,
+"max_score": max_possible_score,
+"disruptive_analysis": disruptive_analysis,
+"innovation_analysis": innovation_analysis,
+"valuation_analysis": valuation_analysis
+}
+progress.update_status("cathie_wood_agent", ticker, "Generating Cathie Wood style analysis")
+cw_output = generate_cathie_wood_output(
+ticker=ticker,
+analysis_data=analysis_data,
+model_name=state["metadata"]["model_name"],
+model_provider=state["metadata"]["model_provider"],
+)
+cw_analysis[ticker] = {
+"signal": cw_output.signal,
+"confidence": cw_output.confidence,
+"reasoning": cw_output.reasoning
+}
+progress.update_status("cathie_wood_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(cw_analysis),
+name="cathie_wood_agent"
+)
+if state["metadata"].get("show_reasoning"):
+show_agent_reasoning(cw_analysis, "Cathie Wood Agent")
+state["data"]["analyst_signals"]["cathie_wood_agent"] = cw_analysis
+return {
+"messages": [message],
+"data": state["data"]
+}
+def analyze_disruptive_potential(metrics: list, financial_line_items: list) -> dict:
+score = 0
+details = []
+if not metrics or not financial_line_items:
+return {
+"score": 0,
+"details": "Insufficient data to analyze disruptive potential"
+}
+revenues = [item.revenue for item in financial_line_items if item.revenue]
+if len(revenues) >= 3:
+growth_rates = []
+for i in range(len(revenues)-1):
+if revenues[i] and revenues[i+1]:
+growth_rate = (revenues[i+1] - revenues[i]) / abs(revenues[i]) if revenues[i] != 0 else 0
+growth_rates.append(growth_rate)
+if len(growth_rates) >= 2 and growth_rates[-1] > growth_rates[0]:
+score += 2
+details.append(f"Revenue growth is accelerating: {(growth_rates[-1]*100):.1f}% vs {(growth_rates[0]*100):.1f}%")
+latest_growth = growth_rates[-1] if growth_rates else 0
+if latest_growth > 1.0:
+score += 3
+details.append(f"Exceptional revenue growth: {(latest_growth*100):.1f}%")
+elif latest_growth > 0.5:
+score += 2
+details.append(f"Strong revenue growth: {(latest_growth*100):.1f}%")
+elif latest_growth > 0.2:
+score += 1
+details.append(f"Moderate revenue growth: {(latest_growth*100):.1f}%")
+else:
+details.append("Insufficient revenue data for growth analysis")
+gross_margins = [item.gross_margin for item in financial_line_items if hasattr(item, 'gross_margin') and item.gross_margin is not None]
+if len(gross_margins) >= 2:
+margin_trend = gross_margins[-1] - gross_margins[0]
+if margin_trend > 0.05:
+score += 2
+details.append(f"Expanding gross margins: +{(margin_trend*100):.1f}%")
+elif margin_trend > 0:
+score += 1
+details.append(f"Slightly improving gross margins: +{(margin_trend*100):.1f}%")
+if gross_margins[-1] > 0.50:
+score += 2
+details.append(f"High gross margin: {(gross_margins[-1]*100):.1f}%")
+else:
+details.append("Insufficient gross margin data")
+revenues = [item.revenue for item in financial_line_items if item.revenue]
+operating_expenses = [
+item.operating_expense
+for item in financial_line_items
+if hasattr(item, "operating_expense") and item.operating_expense
+]
+if len(revenues) >= 2 and len(operating_expenses) >= 2:
+rev_growth = (revenues[-1] - revenues[0]) / abs(revenues[0])
+opex_growth = (operating_expenses[-1] - operating_expenses[0]) / abs(operating_expenses[0])
+if rev_growth > opex_growth:
+score += 2
+details.append("Positive operating leverage: Revenue growing faster than expenses")
+else:
+details.append("Insufficient data for operating leverage analysis")
+rd_expenses = [item.research_and_development for item in financial_line_items if hasattr(item, 'research_and_development') and item.research_and_development is not None]
+if rd_expenses and revenues:
+rd_intensity = rd_expenses[-1] / revenues[-1]
+if rd_intensity > 0.15:
+score += 3
+details.append(f"High R&D investment: {(rd_intensity*100):.1f}% of revenue")
+elif rd_intensity > 0.08:
+score += 2
+details.append(f"Moderate R&D investment: {(rd_intensity*100):.1f}% of revenue")
+elif rd_intensity > 0.05:
+score += 1
+details.append(f"Some R&D investment: {(rd_intensity*100):.1f}% of revenue")
+else:
+details.append("No R&D data available")
+max_possible_score = 12
+normalized_score = (score / max_possible_score) * 5
+return {
+"score": normalized_score,
+"details": "; ".join(details),
+"raw_score": score,
+"max_score": max_possible_score
+}
+def analyze_innovation_growth(metrics: list, financial_line_items: list) -> dict:
+score = 0
+details = []
+if not metrics or not financial_line_items:
+return {
+"score": 0,
+"details": "Insufficient data to analyze innovation-driven growth"
+}
+rd_expenses = [
+item.research_and_development
+for item in financial_line_items
+if hasattr(item, "research_and_development") and item.research_and_development
+]
+revenues = [item.revenue for item in financial_line_items if item.revenue]
+if rd_expenses and revenues and len(rd_expenses) >= 2:
+rd_growth = (rd_expenses[-1] - rd_expenses[0]) / abs(rd_expenses[0]) if rd_expenses[0] != 0 else 0
+if rd_growth > 0.5:
+score += 3
+details.append(f"Strong R&D investment growth: +{(rd_growth*100):.1f}%")
+elif rd_growth > 0.2:
+score += 2
+details.append(f"Moderate R&D investment growth: +{(rd_growth*100):.1f}%")
+rd_intensity_start = rd_expenses[0] / revenues[0]
+rd_intensity_end = rd_expenses[-1] / revenues[-1]
+if rd_intensity_end > rd_intensity_start:
+score += 2
+details.append(f"Increasing R&D intensity: {(rd_intensity_end*100):.1f}% vs {(rd_intensity_start*100):.1f}%")
+else:
+details.append("Insufficient R&D data for trend analysis")
+fcf_vals = [item.free_cash_flow for item in financial_line_items if item.free_cash_flow]
+if fcf_vals and len(fcf_vals) >= 2:
+fcf_growth = (fcf_vals[-1] - fcf_vals[0]) / abs(fcf_vals[0])
+positive_fcf_count = sum(1 for f in fcf_vals if f > 0)
+if fcf_growth > 0.3 and positive_fcf_count == len(fcf_vals):
+score += 3
+details.append("Strong and consistent FCF growth, excellent innovation funding capacity")
+elif positive_fcf_count >= len(fcf_vals) * 0.75:
+score += 2
+details.append("Consistent positive FCF, good innovation funding capacity")
+elif positive_fcf_count > len(fcf_vals) * 0.5:
+score += 1
+details.append("Moderately consistent FCF, adequate innovation funding capacity")
+else:
+details.append("Insufficient FCF data for analysis")
+op_margin_vals = [item.operating_margin for item in financial_line_items if item.operating_margin]
+if op_margin_vals and len(op_margin_vals) >= 2:
+margin_trend = op_margin_vals[-1] - op_margin_vals[0]
+if op_margin_vals[-1] > 0.15 and margin_trend > 0:
+score += 3
+details.append(f"Strong and improving operating margin: {(op_margin_vals[-1]*100):.1f}%")
+elif op_margin_vals[-1] > 0.10:
+score += 2
+details.append(f"Healthy operating margin: {(op_margin_vals[-1]*100):.1f}%")
+elif margin_trend > 0:
+score += 1
+details.append("Improving operating efficiency")
+else:
+details.append("Insufficient operating margin data")
+capex = [item.capital_expenditure for item in financial_line_items if hasattr(item, 'capital_expenditure') and item.capital_expenditure]
+if capex and revenues and len(capex) >= 2:
+capex_intensity = abs(capex[-1]) / revenues[-1]
+capex_growth = (abs(capex[-1]) - abs(capex[0])) / abs(capex[0]) if capex[0] != 0 else 0
+if capex_intensity > 0.10 and capex_growth > 0.2:
+score += 2
+details.append("Strong investment in growth infrastructure")
+elif capex_intensity > 0.05:
+score += 1
+details.append("Moderate investment in growth infrastructure")
+else:
+details.append("Insufficient CAPEX data")
+dividends = [item.dividends_and_other_cash_distributions for item in financial_line_items if hasattr(item, 'dividends_and_other_cash_distributions') and item.dividends_and_other_cash_distributions]
+if dividends and fcf_vals:
+latest_payout_ratio = dividends[-1] / fcf_vals[-1] if fcf_vals[-1] != 0 else 1
+if latest_payout_ratio < 0.2:
+score += 2
+details.append("Strong focus on reinvestment over dividends")
+elif latest_payout_ratio < 0.4:
+score += 1
+details.append("Moderate focus on reinvestment over dividends")
+else:
+details.append("Insufficient dividend data")
+max_possible_score = 15
+normalized_score = (score / max_possible_score) * 5
+return {
+"score": normalized_score,
+"details": "; ".join(details),
+"raw_score": score,
+"max_score": max_possible_score
+}
+def analyze_cathie_wood_valuation(financial_line_items: list, market_cap: float) -> dict:
+if not financial_line_items or market_cap is None:
+return {
+"score": 0,
+"details": "Insufficient data for valuation"
+}
+latest = financial_line_items[-1]
+fcf = latest.free_cash_flow if latest.free_cash_flow else 0
+if fcf <= 0:
+return {
+"score": 0,
+"details": f"No positive FCF for valuation; FCF = {fcf}",
+"intrinsic_value": None
+}
+growth_rate = 0.20
+discount_rate = 0.15
+terminal_multiple = 25
+projection_years = 5
+present_value = 0
+for year in range(1, projection_years + 1):
+future_fcf = fcf * (1 + growth_rate) ** year
+pv = future_fcf / ((1 + discount_rate) ** year)
+present_value += pv
+terminal_value = (fcf * (1 + growth_rate) ** projection_years * terminal_multiple) \
+/ ((1 + discount_rate) ** projection_years)
+intrinsic_value = present_value + terminal_value
+margin_of_safety = (intrinsic_value - market_cap) / market_cap
+score = 0
+if margin_of_safety > 0.5:
+score += 3
+elif margin_of_safety > 0.2:
+score += 1
+details = [
+f"Calculated intrinsic value: ~{intrinsic_value:,.2f}",
+f"Market cap: ~{market_cap:,.2f}",
+f"Margin of safety: {margin_of_safety:.2%}"
+]
+return {
+"score": score,
+"details": "; ".join(details),
+"intrinsic_value": intrinsic_value,
+"margin_of_safety": margin_of_safety
+}
+def generate_cathie_wood_output(
+ticker: str,
+analysis_data: dict[str, any],
+model_name: str,
+model_provider: str,
+) -> CathieWoodSignal:
+template = ChatPromptTemplate.from_messages([
+(
+"system",
+),
+(
+"human",
+)
+])
+prompt = template.invoke({
+"analysis_data": json.dumps(analysis_data, indent=2),
+"ticker": ticker
+})
+def create_default_cathie_wood_signal():
+return CathieWoodSignal(
+signal="neutral",
+confidence=0.0,
+reasoning="Error in analysis, defaulting to neutral"
+)
+return call_llm(
+prompt=prompt,
+model_name=model_name,
+model_provider=model_provider,
+pydantic_model=CathieWoodSignal,
+agent_name="cathie_wood_agent",
+default_factory=create_default_cathie_wood_signal,
+)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/portfolio_manager.py
+import json
+from langchain_core.messages import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from graph.state import AgentState, show_agent_reasoning
+from pydantic import BaseModel, Field
+from typing_extensions import Literal
+from utils.progress import progress
+from utils.llm import call_llm
+class PortfolioDecision(BaseModel):
+action: Literal["buy", "sell", "short", "cover", "hold"]
+quantity: int = Field(description="Number of shares to trade")
+confidence: float = Field(description="Confidence in the decision, between 0.0 and 100.0")
+reasoning: str = Field(description="Reasoning for the decision")
+class PortfolioManagerOutput(BaseModel):
+decisions: dict[str, PortfolioDecision] = Field(description="Dictionary of ticker to trading decisions")
+def portfolio_management_agent(state: AgentState):
+portfolio = state["data"]["portfolio"]
+analyst_signals = state["data"]["analyst_signals"]
+tickers = state["data"]["tickers"]
+progress.update_status("portfolio_management_agent", None, "Analyzing signals")
+position_limits = {}
+current_prices = {}
+max_shares = {}
+signals_by_ticker = {}
+for ticker in tickers:
+progress.update_status("portfolio_management_agent", ticker, "Processing analyst signals")
+risk_data = analyst_signals.get("risk_management_agent", {}).get(ticker, {})
+position_limits[ticker] = risk_data.get("remaining_position_limit", 0)
+current_prices[ticker] = risk_data.get("current_price", 0)
+if current_prices[ticker] > 0:
+max_shares[ticker] = int(position_limits[ticker] / current_prices[ticker])
+else:
+max_shares[ticker] = 0
+ticker_signals = {}
+for agent, signals in analyst_signals.items():
+if agent != "risk_management_agent" and ticker in signals:
+ticker_signals[agent] = {"signal": signals[ticker]["signal"], "confidence": signals[ticker]["confidence"]}
+signals_by_ticker[ticker] = ticker_signals
+progress.update_status("portfolio_management_agent", None, "Making trading decisions")
+result = generate_trading_decision(
+tickers=tickers,
+signals_by_ticker=signals_by_ticker,
+current_prices=current_prices,
+max_shares=max_shares,
+portfolio=portfolio,
+model_name=state["metadata"]["model_name"],
+model_provider=state["metadata"]["model_provider"],
+)
+message = HumanMessage(
+content=json.dumps({ticker: decision.model_dump() for ticker, decision in result.decisions.items()}),
+name="portfolio_management",
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning({ticker: decision.model_dump() for ticker, decision in result.decisions.items()}, "Portfolio Management Agent")
+progress.update_status("portfolio_management_agent", None, "Done")
+return {
+"messages": state["messages"] + [message],
+"data": state["data"],
+}
+def generate_trading_decision(
+tickers: list[str],
+signals_by_ticker: dict[str, dict],
+current_prices: dict[str, float],
+max_shares: dict[str, int],
+portfolio: dict[str, float],
+model_name: str,
+model_provider: str,
+) -> PortfolioManagerOutput:
+template = ChatPromptTemplate.from_messages(
+[
+(
+"system",
+,
+),
+(
+"human",
+,
+),
+]
+)
+prompt = template.invoke(
+{
+"signals_by_ticker": json.dumps(signals_by_ticker, indent=2),
+"current_prices": json.dumps(current_prices, indent=2),
+"max_shares": json.dumps(max_shares, indent=2),
+"portfolio_cash": f"{portfolio.get('cash', 0):.2f}",
+"portfolio_positions": json.dumps(portfolio.get('positions', {}), indent=2),
+"margin_requirement": f"{portfolio.get('margin_requirement', 0):.2f}",
+}
+)
+def create_default_portfolio_output():
+return PortfolioManagerOutput(decisions={ticker: PortfolioDecision(action="hold", quantity=0, confidence=0.0, reasoning="Error in portfolio management, defaulting to hold") for ticker in tickers})
+return call_llm(prompt=prompt, model_name=model_name, model_provider=model_provider, pydantic_model=PortfolioManagerOutput, agent_name="portfolio_management_agent", default_factory=create_default_portfolio_output)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/bill_ackman.py
+from langchain_openai import ChatOpenAI
+from graph.state import AgentState, show_agent_reasoning
+from tools.api import get_financial_metrics, get_market_cap, search_line_items
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+import json
+from typing_extensions import Literal
+from utils.progress import progress
+from utils.llm import call_llm
+class BillAckmanSignal(BaseModel):
+signal: Literal["bullish", "bearish", "neutral"]
+confidence: float
+reasoning: str
+def bill_ackman_agent(state: AgentState):
+data = state["data"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+analysis_data = {}
+ackman_analysis = {}
+for ticker in tickers:
+progress.update_status("bill_ackman_agent", ticker, "Fetching financial metrics")
+metrics = get_financial_metrics(ticker, end_date, period="annual", limit=5)
+progress.update_status("bill_ackman_agent", ticker, "Gathering financial line items")
+financial_line_items = search_line_items(
+ticker,
+[
+"revenue",
+"operating_margin",
+"debt_to_equity",
+"free_cash_flow",
+"total_assets",
+"total_liabilities",
+"dividends_and_other_cash_distributions",
+"outstanding_shares"
+],
+end_date,
+period="annual",
+limit=5
+)
+progress.update_status("bill_ackman_agent", ticker, "Getting market cap")
+market_cap = get_market_cap(ticker, end_date)
+progress.update_status("bill_ackman_agent", ticker, "Analyzing business quality")
+quality_analysis = analyze_business_quality(metrics, financial_line_items)
+progress.update_status("bill_ackman_agent", ticker, "Analyzing balance sheet and capital structure")
+balance_sheet_analysis = analyze_financial_discipline(metrics, financial_line_items)
+progress.update_status("bill_ackman_agent", ticker, "Calculating intrinsic value & margin of safety")
+valuation_analysis = analyze_valuation(financial_line_items, market_cap)
+total_score = quality_analysis["score"] + balance_sheet_analysis["score"] + valuation_analysis["score"]
+max_possible_score = 15
+if total_score >= 0.7 * max_possible_score:
+signal = "bullish"
+elif total_score <= 0.3 * max_possible_score:
+signal = "bearish"
+else:
+signal = "neutral"
+analysis_data[ticker] = {
+"signal": signal,
+"score": total_score,
+"max_score": max_possible_score,
+"quality_analysis": quality_analysis,
+"balance_sheet_analysis": balance_sheet_analysis,
+"valuation_analysis": valuation_analysis
+}
+progress.update_status("bill_ackman_agent", ticker, "Generating Ackman analysis")
+ackman_output = generate_ackman_output(
+ticker=ticker,
+analysis_data=analysis_data,
+model_name=state["metadata"]["model_name"],
+model_provider=state["metadata"]["model_provider"],
+)
+ackman_analysis[ticker] = {
+"signal": ackman_output.signal,
+"confidence": ackman_output.confidence,
+"reasoning": ackman_output.reasoning
+}
+progress.update_status("bill_ackman_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(ackman_analysis),
+name="bill_ackman_agent"
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(ackman_analysis, "Bill Ackman Agent")
+state["data"]["analyst_signals"]["bill_ackman_agent"] = ackman_analysis
+return {
+"messages": [message],
+"data": state["data"]
+}
+def analyze_business_quality(metrics: list, financial_line_items: list) -> dict:
+score = 0
+details = []
+if not metrics or not financial_line_items:
+return {
+"score": 0,
+"details": "Insufficient data to analyze business quality"
+}
+revenues = [item.revenue for item in financial_line_items if item.revenue is not None]
+if len(revenues) >= 2:
+initial, final = revenues[0], revenues[-1]
+if initial and final and final > initial:
+growth_rate = (final - initial) / abs(initial)
+if growth_rate > 0.5:
+score += 2
+details.append(f"Revenue grew by {(growth_rate*100):.1f}% over the full period.")
+else:
+score += 1
+details.append(f"Revenue growth is positive but under 50% cumulatively ({(growth_rate*100):.1f}%).")
+else:
+details.append("Revenue did not grow significantly or data insufficient.")
+else:
+details.append("Not enough revenue data for multi-period trend.")
+fcf_vals = [item.free_cash_flow for item in financial_line_items if item.free_cash_flow is not None]
+op_margin_vals = [item.operating_margin for item in financial_line_items if item.operating_margin is not None]
+if op_margin_vals:
+above_15 = sum(1 for m in op_margin_vals if m > 0.15)
+if above_15 >= (len(op_margin_vals) // 2 + 1):
+score += 2
+details.append("Operating margins have often exceeded 15%.")
+else:
+details.append("Operating margin not consistently above 15%.")
+else:
+details.append("No operating margin data across periods.")
+if fcf_vals:
+positive_fcf_count = sum(1 for f in fcf_vals if f > 0)
+if positive_fcf_count >= (len(fcf_vals) // 2 + 1):
+score += 1
+details.append("Majority of periods show positive free cash flow.")
+else:
+details.append("Free cash flow not consistently positive.")
+else:
+details.append("No free cash flow data across periods.")
+latest_metrics = metrics[0]
+if latest_metrics.return_on_equity and latest_metrics.return_on_equity > 0.15:
+score += 2
+details.append(f"High ROE of {latest_metrics.return_on_equity:.1%}, indicating potential moat.")
+elif latest_metrics.return_on_equity:
+details.append(f"ROE of {latest_metrics.return_on_equity:.1%} is not indicative of a strong moat.")
+else:
+details.append("ROE data not available in metrics.")
+return {
+"score": score,
+"details": "; ".join(details)
+}
+def analyze_financial_discipline(metrics: list, financial_line_items: list) -> dict:
+score = 0
+details = []
+if not metrics or not financial_line_items:
+return {
+"score": 0,
+"details": "Insufficient data to analyze financial discipline"
+}
+debt_to_equity_vals = [item.debt_to_equity for item in financial_line_items if item.debt_to_equity is not None]
+if debt_to_equity_vals:
+below_one_count = sum(1 for d in debt_to_equity_vals if d < 1.0)
+if below_one_count >= (len(debt_to_equity_vals) // 2 + 1):
+score += 2
+details.append("Debt-to-equity < 1.0 for the majority of periods.")
+else:
+details.append("Debt-to-equity >= 1.0 in many periods.")
+else:
+liab_to_assets = []
+for item in financial_line_items:
+if item.total_liabilities and item.total_assets and item.total_assets > 0:
+liab_to_assets.append(item.total_liabilities / item.total_assets)
+if liab_to_assets:
+below_50pct_count = sum(1 for ratio in liab_to_assets if ratio < 0.5)
+if below_50pct_count >= (len(liab_to_assets) // 2 + 1):
+score += 2
+details.append("Liabilities-to-assets < 50% for majority of periods.")
+else:
+details.append("Liabilities-to-assets >= 50% in many periods.")
+else:
+details.append("No consistent leverage ratio data available.")
+dividends_list = [item.dividends_and_other_cash_distributions for item in financial_line_items if item.dividends_and_other_cash_distributions is not None]
+if dividends_list:
+paying_dividends_count = sum(1 for d in dividends_list if d < 0)
+if paying_dividends_count >= (len(dividends_list) // 2 + 1):
+score += 1
+details.append("Company has a history of returning capital to shareholders (dividends).")
+else:
+details.append("Dividends not consistently paid or no data.")
+else:
+details.append("No dividend data found across periods.")
+shares = [item.outstanding_shares for item in financial_line_items if item.outstanding_shares is not None]
+if len(shares) >= 2:
+if shares[-1] < shares[0]:
+score += 1
+details.append("Outstanding shares have decreased over time (possible buybacks).")
+else:
+details.append("Outstanding shares have not decreased over the available periods.")
+else:
+details.append("No multi-period share count data to assess buybacks.")
+return {
+"score": score,
+"details": "; ".join(details)
+}
+def analyze_valuation(financial_line_items: list, market_cap: float) -> dict:
+if not financial_line_items or market_cap is None:
+return {
+"score": 0,
+"details": "Insufficient data to perform valuation"
+}
+latest = financial_line_items[-1]
+fcf = latest.free_cash_flow if latest.free_cash_flow else 0
+growth_rate = 0.06
+discount_rate = 0.10
+terminal_multiple = 15
+projection_years = 5
+if fcf <= 0:
+return {
+"score": 0,
+"details": f"No positive FCF for valuation; FCF = {fcf}",
+"intrinsic_value": None
+}
+present_value = 0
+for year in range(1, projection_years + 1):
+future_fcf = fcf * (1 + growth_rate) ** year
+pv = future_fcf / ((1 + discount_rate) ** year)
+present_value += pv
+terminal_value = (fcf * (1 + growth_rate) ** projection_years * terminal_multiple) \
+/ ((1 + discount_rate) ** projection_years)
+intrinsic_value = present_value + terminal_value
+margin_of_safety = (intrinsic_value - market_cap) / market_cap
+score = 0
+if margin_of_safety > 0.3:
+score += 3
+elif margin_of_safety > 0.1:
+score += 1
+details = [
+f"Calculated intrinsic value: ~{intrinsic_value:,.2f}",
+f"Market cap: ~{market_cap:,.2f}",
+f"Margin of safety: {margin_of_safety:.2%}"
+]
+return {
+"score": score,
+"details": "; ".join(details),
+"intrinsic_value": intrinsic_value,
+"margin_of_safety": margin_of_safety
+}
+def generate_ackman_output(
+ticker: str,
+analysis_data: dict[str, any],
+model_name: str,
+model_provider: str,
+) -> BillAckmanSignal:
+template = ChatPromptTemplate.from_messages([
+(
+"system",
+),
+(
+"human",
+)
+])
+prompt = template.invoke({
+"analysis_data": json.dumps(analysis_data, indent=2),
+"ticker": ticker
+})
+def create_default_bill_ackman_signal():
+return BillAckmanSignal(
+signal="neutral",
+confidence=0.0,
+reasoning="Error in analysis, defaulting to neutral"
+)
+return call_llm(
+prompt=prompt,
+model_name=model_name,
+model_provider=model_provider,
+pydantic_model=BillAckmanSignal,
+agent_name="bill_ackman_agent",
+default_factory=create_default_bill_ackman_signal,
+)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/valuation.py
+from langchain_core.messages import HumanMessage
+from graph.state import AgentState, show_agent_reasoning
+from utils.progress import progress
+import json
+from tools.api import get_financial_metrics, get_market_cap, search_line_items
+def valuation_agent(state: AgentState):
+data = state["data"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+valuation_analysis = {}
+for ticker in tickers:
+progress.update_status("valuation_agent", ticker, "Fetching financial data")
+financial_metrics = get_financial_metrics(
+ticker=ticker,
+end_date=end_date,
+period="ttm",
+)
+if not financial_metrics:
+progress.update_status("valuation_agent", ticker, "Failed: No financial metrics found")
+continue
+metrics = financial_metrics[0]
+progress.update_status("valuation_agent", ticker, "Gathering line items")
+financial_line_items = search_line_items(
+ticker=ticker,
+line_items=[
+"free_cash_flow",
+"net_income",
+"depreciation_and_amortization",
+"capital_expenditure",
+"working_capital",
+],
+end_date=end_date,
+period="ttm",
+limit=2,
+)
+if len(financial_line_items) < 2:
+progress.update_status("valuation_agent", ticker, "Failed: Insufficient financial line items")
+continue
+current_financial_line_item = financial_line_items[0]
+previous_financial_line_item = financial_line_items[1]
+progress.update_status("valuation_agent", ticker, "Calculating owner earnings")
+working_capital_change = current_financial_line_item.working_capital - previous_financial_line_item.working_capital
+owner_earnings_value = calculate_owner_earnings_value(
+net_income=current_financial_line_item.net_income,
+depreciation=current_financial_line_item.depreciation_and_amortization,
+capex=current_financial_line_item.capital_expenditure,
+working_capital_change=working_capital_change,
+growth_rate=metrics.earnings_growth,
+required_return=0.15,
+margin_of_safety=0.25,
+)
+progress.update_status("valuation_agent", ticker, "Calculating DCF value")
+dcf_value = calculate_intrinsic_value(
+free_cash_flow=current_financial_line_item.free_cash_flow,
+growth_rate=metrics.earnings_growth,
+discount_rate=0.10,
+terminal_growth_rate=0.03,
+num_years=5,
+)
+progress.update_status("valuation_agent", ticker, "Comparing to market value")
+market_cap = get_market_cap(ticker=ticker, end_date=end_date)
+dcf_gap = (dcf_value - market_cap) / market_cap
+owner_earnings_gap = (owner_earnings_value - market_cap) / market_cap
+valuation_gap = (dcf_gap + owner_earnings_gap) / 2
+if valuation_gap > 0.15:
+signal = "bullish"
+elif valuation_gap < -0.15:
+signal = "bearish"
+else:
+signal = "neutral"
+reasoning = {}
+reasoning["dcf_analysis"] = {
+"signal": ("bullish" if dcf_gap > 0.15 else "bearish" if dcf_gap < -0.15 else "neutral"),
+"details": f"Intrinsic Value: ${dcf_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {dcf_gap:.1%}",
+}
+reasoning["owner_earnings_analysis"] = {
+"signal": ("bullish" if owner_earnings_gap > 0.15 else "bearish" if owner_earnings_gap < -0.15 else "neutral"),
+"details": f"Owner Earnings Value: ${owner_earnings_value:,.2f}, Market Cap: ${market_cap:,.2f}, Gap: {owner_earnings_gap:.1%}",
+}
+confidence = round(abs(valuation_gap), 2) * 100
+valuation_analysis[ticker] = {
+"signal": signal,
+"confidence": confidence,
+"reasoning": reasoning,
+}
+progress.update_status("valuation_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(valuation_analysis),
+name="valuation_agent",
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(valuation_analysis, "Valuation Analysis Agent")
+state["data"]["analyst_signals"]["valuation_agent"] = valuation_analysis
+return {
+"messages": [message],
+"data": data,
+}
+def calculate_owner_earnings_value(
+net_income: float,
+depreciation: float,
+capex: float,
+working_capital_change: float,
+growth_rate: float = 0.05,
+required_return: float = 0.15,
+margin_of_safety: float = 0.25,
+num_years: int = 5,
+) -> float:
+if not all([isinstance(x, (int, float)) for x in [net_income, depreciation, capex, working_capital_change]]):
+return 0
+owner_earnings = net_income + depreciation - capex - working_capital_change
+if owner_earnings <= 0:
+return 0
+future_values = []
+for year in range(1, num_years + 1):
+future_value = owner_earnings * (1 + growth_rate) ** year
+discounted_value = future_value / (1 + required_return) ** year
+future_values.append(discounted_value)
+terminal_growth = min(growth_rate, 0.03)
+terminal_value = (future_values[-1] * (1 + terminal_growth)) / (required_return - terminal_growth)
+terminal_value_discounted = terminal_value / (1 + required_return) ** num_years
+intrinsic_value = sum(future_values) + terminal_value_discounted
+value_with_safety_margin = intrinsic_value * (1 - margin_of_safety)
+return value_with_safety_margin
+def calculate_intrinsic_value(
+free_cash_flow: float,
+growth_rate: float = 0.05,
+discount_rate: float = 0.10,
+terminal_growth_rate: float = 0.02,
+num_years: int = 5,
+) -> float:
+cash_flows = [free_cash_flow * (1 + growth_rate) ** i for i in range(num_years)]
+present_values = []
+for i in range(num_years):
+present_value = cash_flows[i] / (1 + discount_rate) ** (i + 1)
+present_values.append(present_value)
+terminal_value = cash_flows[-1] * (1 + terminal_growth_rate) / (discount_rate - terminal_growth_rate)
+terminal_present_value = terminal_value / (1 + discount_rate) ** num_years
+dcf_value = sum(present_values) + terminal_present_value
+return dcf_value
+def calculate_working_capital_change(
+current_working_capital: float,
+previous_working_capital: float,
+) -> float:
+return current_working_capital - previous_working_capital
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/charlie_munger.py
+from langchain_openai import ChatOpenAI
+from graph.state import AgentState, show_agent_reasoning
+from tools.api import get_financial_metrics, get_market_cap, search_line_items, get_insider_trades, get_company_news
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+import json
+from typing_extensions import Literal
+from utils.progress import progress
+from utils.llm import call_llm
+class CharlieMungerSignal(BaseModel):
+signal: Literal["bullish", "bearish", "neutral"]
+confidence: float
+reasoning: str
+def charlie_munger_agent(state: AgentState):
+data = state["data"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+analysis_data = {}
+munger_analysis = {}
+for ticker in tickers:
+progress.update_status("charlie_munger_agent", ticker, "Fetching financial metrics")
+metrics = get_financial_metrics(ticker, end_date, period="annual", limit=10)
+progress.update_status("charlie_munger_agent", ticker, "Gathering financial line items")
+financial_line_items = search_line_items(
+ticker,
+[
+"revenue",
+"net_income",
+"operating_income",
+"return_on_invested_capital",
+"gross_margin",
+"operating_margin",
+"free_cash_flow",
+"capital_expenditure",
+"cash_and_equivalents",
+"total_debt",
+"shareholders_equity",
+"outstanding_shares",
+"research_and_development",
+"goodwill_and_intangible_assets",
+],
+end_date,
+period="annual",
+limit=10
+)
+progress.update_status("charlie_munger_agent", ticker, "Getting market cap")
+market_cap = get_market_cap(ticker, end_date)
+progress.update_status("charlie_munger_agent", ticker, "Fetching insider trades")
+insider_trades = get_insider_trades(
+ticker,
+end_date,
+start_date=None,
+limit=100
+)
+progress.update_status("charlie_munger_agent", ticker, "Fetching company news")
+company_news = get_company_news(
+ticker,
+end_date,
+start_date=None,
+limit=100
+)
+progress.update_status("charlie_munger_agent", ticker, "Analyzing moat strength")
+moat_analysis = analyze_moat_strength(metrics, financial_line_items)
+progress.update_status("charlie_munger_agent", ticker, "Analyzing management quality")
+management_analysis = analyze_management_quality(financial_line_items, insider_trades)
+progress.update_status("charlie_munger_agent", ticker, "Analyzing business predictability")
+predictability_analysis = analyze_predictability(financial_line_items)
+progress.update_status("charlie_munger_agent", ticker, "Calculating Munger-style valuation")
+valuation_analysis = calculate_munger_valuation(financial_line_items, market_cap)
+total_score = (
+moat_analysis["score"] * 0.35 +
+management_analysis["score"] * 0.25 +
+predictability_analysis["score"] * 0.25 +
+valuation_analysis["score"] * 0.15
+)
+max_possible_score = 10
+if total_score >= 7.5:
+signal = "bullish"
+elif total_score <= 4.5:
+signal = "bearish"
+else:
+signal = "neutral"
+analysis_data[ticker] = {
+"signal": signal,
+"score": total_score,
+"max_score": max_possible_score,
+"moat_analysis": moat_analysis,
+"management_analysis": management_analysis,
+"predictability_analysis": predictability_analysis,
+"valuation_analysis": valuation_analysis,
+"news_sentiment": analyze_news_sentiment(company_news) if company_news else "No news data available"
+}
+progress.update_status("charlie_munger_agent", ticker, "Generating Munger analysis")
+munger_output = generate_munger_output(
+ticker=ticker,
+analysis_data=analysis_data,
+model_name=state["metadata"]["model_name"],
+model_provider=state["metadata"]["model_provider"],
+)
+munger_analysis[ticker] = {
+"signal": munger_output.signal,
+"confidence": munger_output.confidence,
+"reasoning": munger_output.reasoning
+}
+progress.update_status("charlie_munger_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(munger_analysis),
+name="charlie_munger_agent"
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(munger_analysis, "Charlie Munger Agent")
+state["data"]["analyst_signals"]["charlie_munger_agent"] = munger_analysis
+return {
+"messages": [message],
+"data": state["data"]
+}
+def analyze_moat_strength(metrics: list, financial_line_items: list) -> dict:
+score = 0
+details = []
+if not metrics or not financial_line_items:
+return {
+"score": 0,
+"details": "Insufficient data to analyze moat strength"
+}
+roic_values = [item.return_on_invested_capital for item in financial_line_items
+if hasattr(item, 'return_on_invested_capital') and item.return_on_invested_capital is not None]
+if roic_values:
+high_roic_count = sum(1 for r in roic_values if r > 0.15)
+if high_roic_count >= len(roic_values) * 0.8:
+score += 3
+details.append(f"Excellent ROIC: >15% in {high_roic_count}/{len(roic_values)} periods")
+elif high_roic_count >= len(roic_values) * 0.5:
+score += 2
+details.append(f"Good ROIC: >15% in {high_roic_count}/{len(roic_values)} periods")
+elif high_roic_count > 0:
+score += 1
+details.append(f"Mixed ROIC: >15% in only {high_roic_count}/{len(roic_values)} periods")
+else:
+details.append("Poor ROIC: Never exceeds 15% threshold")
+else:
+details.append("No ROIC data available")
+gross_margins = [item.gross_margin for item in financial_line_items
+if hasattr(item, 'gross_margin') and item.gross_margin is not None]
+if gross_margins and len(gross_margins) >= 3:
+margin_trend = sum(1 for i in range(1, len(gross_margins)) if gross_margins[i] >= gross_margins[i-1])
+if margin_trend >= len(gross_margins) * 0.7:
+score += 2
+details.append("Strong pricing power: Gross margins consistently improving")
+elif sum(gross_margins) / len(gross_margins) > 0.3:
+score += 1
+details.append(f"Good pricing power: Average gross margin {sum(gross_margins)/len(gross_margins):.1%}")
+else:
+details.append("Limited pricing power: Low or declining gross margins")
+else:
+details.append("Insufficient gross margin data")
+if len(financial_line_items) >= 3:
+capex_to_revenue = []
+for item in financial_line_items:
+if (hasattr(item, 'capital_expenditure') and item.capital_expenditure is not None and
+hasattr(item, 'revenue') and item.revenue is not None and item.revenue > 0):
+capex_ratio = abs(item.capital_expenditure) / item.revenue
+capex_to_revenue.append(capex_ratio)
+if capex_to_revenue:
+avg_capex_ratio = sum(capex_to_revenue) / len(capex_to_revenue)
+if avg_capex_ratio < 0.05:
+score += 2
+details.append(f"Low capital requirements: Avg capex {avg_capex_ratio:.1%} of revenue")
+elif avg_capex_ratio < 0.10:
+score += 1
+details.append(f"Moderate capital requirements: Avg capex {avg_capex_ratio:.1%} of revenue")
+else:
+details.append(f"High capital requirements: Avg capex {avg_capex_ratio:.1%} of revenue")
+else:
+details.append("No capital expenditure data available")
+else:
+details.append("Insufficient data for capital intensity analysis")
+r_and_d = [item.research_and_development for item in financial_line_items
+if hasattr(item, 'research_and_development') and item.research_and_development is not None]
+goodwill_and_intangible_assets = [item.goodwill_and_intangible_assets for item in financial_line_items
+if hasattr(item, 'goodwill_and_intangible_assets') and item.goodwill_and_intangible_assets is not None]
+if r_and_d and len(r_and_d) > 0:
+if sum(r_and_d) > 0:
+score += 1
+details.append("Invests in R&D, building intellectual property")
+if (goodwill_and_intangible_assets and len(goodwill_and_intangible_assets) > 0):
+score += 1
+details.append("Significant goodwill/intangible assets, suggesting brand value or IP")
+final_score = min(10, score * 10 / 9)
+return {
+"score": final_score,
+"details": "; ".join(details)
+}
+def analyze_management_quality(financial_line_items: list, insider_trades: list) -> dict:
+score = 0
+details = []
+if not financial_line_items:
+return {
+"score": 0,
+"details": "Insufficient data to analyze management quality"
+}
+fcf_values = [item.free_cash_flow for item in financial_line_items
+if hasattr(item, 'free_cash_flow') and item.free_cash_flow is not None]
+net_income_values = [item.net_income for item in financial_line_items
+if hasattr(item, 'net_income') and item.net_income is not None]
+if fcf_values and net_income_values and len(fcf_values) == len(net_income_values):
+fcf_to_ni_ratios = []
+for i in range(len(fcf_values)):
+if net_income_values[i] and net_income_values[i] > 0:
+fcf_to_ni_ratios.append(fcf_values[i] / net_income_values[i])
+if fcf_to_ni_ratios:
+avg_ratio = sum(fcf_to_ni_ratios) / len(fcf_to_ni_ratios)
+if avg_ratio > 1.1:
+score += 3
+details.append(f"Excellent cash conversion: FCF/NI ratio of {avg_ratio:.2f}")
+elif avg_ratio > 0.9:
+score += 2
+details.append(f"Good cash conversion: FCF/NI ratio of {avg_ratio:.2f}")
+elif avg_ratio > 0.7:
+score += 1
+details.append(f"Moderate cash conversion: FCF/NI ratio of {avg_ratio:.2f}")
+else:
+details.append(f"Poor cash conversion: FCF/NI ratio of only {avg_ratio:.2f}")
+else:
+details.append("Could not calculate FCF to Net Income ratios")
+else:
+details.append("Missing FCF or Net Income data")
+debt_values = [item.total_debt for item in financial_line_items
+if hasattr(item, 'total_debt') and item.total_debt is not None]
+equity_values = [item.shareholders_equity for item in financial_line_items
+if hasattr(item, 'shareholders_equity') and item.shareholders_equity is not None]
+if debt_values and equity_values and len(debt_values) == len(equity_values):
+recent_de_ratio = debt_values[0] / equity_values[0] if equity_values[0] > 0 else float('inf')
+if recent_de_ratio < 0.3:
+score += 3
+details.append(f"Conservative debt management: D/E ratio of {recent_de_ratio:.2f}")
+elif recent_de_ratio < 0.7:
+score += 2
+details.append(f"Prudent debt management: D/E ratio of {recent_de_ratio:.2f}")
+elif recent_de_ratio < 1.5:
+score += 1
+details.append(f"Moderate debt level: D/E ratio of {recent_de_ratio:.2f}")
+else:
+details.append(f"High debt level: D/E ratio of {recent_de_ratio:.2f}")
+else:
+details.append("Missing debt or equity data")
+cash_values = [item.cash_and_equivalents for item in financial_line_items
+if hasattr(item, 'cash_and_equivalents') and item.cash_and_equivalents is not None]
+revenue_values = [item.revenue for item in financial_line_items
+if hasattr(item, 'revenue') and item.revenue is not None]
+if cash_values and revenue_values and len(cash_values) > 0 and len(revenue_values) > 0:
+cash_to_revenue = cash_values[0] / revenue_values[0] if revenue_values[0] > 0 else 0
+if 0.1 <= cash_to_revenue <= 0.25:
+score += 2
+details.append(f"Prudent cash management: Cash/Revenue ratio of {cash_to_revenue:.2f}")
+elif 0.05 <= cash_to_revenue < 0.1 or 0.25 < cash_to_revenue <= 0.4:
+score += 1
+details.append(f"Acceptable cash position: Cash/Revenue ratio of {cash_to_revenue:.2f}")
+elif cash_to_revenue > 0.4:
+details.append(f"Excess cash reserves: Cash/Revenue ratio of {cash_to_revenue:.2f}")
+else:
+details.append(f"Low cash reserves: Cash/Revenue ratio of {cash_to_revenue:.2f}")
+else:
+details.append("Insufficient cash or revenue data")
+if insider_trades and len(insider_trades) > 0:
+buys = sum(1 for trade in insider_trades if hasattr(trade, 'transaction_type') and
+trade.transaction_type and trade.transaction_type.lower() in ['buy', 'purchase'])
+sells = sum(1 for trade in insider_trades if hasattr(trade, 'transaction_type') and
+trade.transaction_type and trade.transaction_type.lower() in ['sell', 'sale'])
+total_trades = buys + sells
+if total_trades > 0:
+buy_ratio = buys / total_trades
+if buy_ratio > 0.7:
+score += 2
+details.append(f"Strong insider buying: {buys}/{total_trades} transactions are purchases")
+elif buy_ratio > 0.4:
+score += 1
+details.append(f"Balanced insider trading: {buys}/{total_trades} transactions are purchases")
+elif buy_ratio < 0.1 and sells > 5:
+score -= 1
+details.append(f"Concerning insider selling: {sells}/{total_trades} transactions are sales")
+else:
+details.append(f"Mixed insider activity: {buys}/{total_trades} transactions are purchases")
+else:
+details.append("No recorded insider transactions")
+else:
+details.append("No insider trading data available")
+share_counts = [item.outstanding_shares for item in financial_line_items
+if hasattr(item, 'outstanding_shares') and item.outstanding_shares is not None]
+if share_counts and len(share_counts) >= 3:
+if share_counts[0] < share_counts[-1] * 0.95:
+score += 2
+details.append("Shareholder-friendly: Reducing share count over time")
+elif share_counts[0] < share_counts[-1] * 1.05:
+score += 1
+details.append("Stable share count: Limited dilution")
+elif share_counts[0] > share_counts[-1] * 1.2:
+score -= 1
+details.append("Concerning dilution: Share count increased significantly")
+else:
+details.append("Moderate share count increase over time")
+else:
+details.append("Insufficient share count data")
+final_score = max(0, min(10, score * 10 / 12))
+return {
+"score": final_score,
+"details": "; ".join(details)
+}
+def analyze_predictability(financial_line_items: list) -> dict:
+score = 0
+details = []
+if not financial_line_items or len(financial_line_items) < 5:
+return {
+"score": 0,
+"details": "Insufficient data to analyze business predictability (need 5+ years)"
+}
+revenues = [item.revenue for item in financial_line_items
+if hasattr(item, 'revenue') and item.revenue is not None]
+if revenues and len(revenues) >= 5:
+growth_rates = [(revenues[i] / revenues[i+1] - 1) for i in range(len(revenues)-1)]
+avg_growth = sum(growth_rates) / len(growth_rates)
+growth_volatility = sum(abs(r - avg_growth) for r in growth_rates) / len(growth_rates)
+if avg_growth > 0.05 and growth_volatility < 0.1:
+score += 3
+details.append(f"Highly predictable revenue: {avg_growth:.1%} avg growth with low volatility")
+elif avg_growth > 0 and growth_volatility < 0.2:
+score += 2
+details.append(f"Moderately predictable revenue: {avg_growth:.1%} avg growth with some volatility")
+elif avg_growth > 0:
+score += 1
+details.append(f"Growing but less predictable revenue: {avg_growth:.1%} avg growth with high volatility")
+else:
+details.append(f"Declining or highly unpredictable revenue: {avg_growth:.1%} avg growth")
+else:
+details.append("Insufficient revenue history for predictability analysis")
+op_income = [item.operating_income for item in financial_line_items
+if hasattr(item, 'operating_income') and item.operating_income is not None]
+if op_income and len(op_income) >= 5:
+positive_periods = sum(1 for income in op_income if income > 0)
+if positive_periods == len(op_income):
+score += 3
+details.append("Highly predictable operations: Operating income positive in all periods")
+elif positive_periods >= len(op_income) * 0.8:
+score += 2
+details.append(f"Predictable operations: Operating income positive in {positive_periods}/{len(op_income)} periods")
+elif positive_periods >= len(op_income) * 0.6:
+score += 1
+details.append(f"Somewhat predictable operations: Operating income positive in {positive_periods}/{len(op_income)} periods")
+else:
+details.append(f"Unpredictable operations: Operating income positive in only {positive_periods}/{len(op_income)} periods")
+else:
+details.append("Insufficient operating income history")
+op_margins = [item.operating_margin for item in financial_line_items
+if hasattr(item, 'operating_margin') and item.operating_margin is not None]
+if op_margins and len(op_margins) >= 5:
+avg_margin = sum(op_margins) / len(op_margins)
+margin_volatility = sum(abs(m - avg_margin) for m in op_margins) / len(op_margins)
+if margin_volatility < 0.03:
+score += 2
+details.append(f"Highly predictable margins: {avg_margin:.1%} avg with minimal volatility")
+elif margin_volatility < 0.07:
+score += 1
+details.append(f"Moderately predictable margins: {avg_margin:.1%} avg with some volatility")
+else:
+details.append(f"Unpredictable margins: {avg_margin:.1%} avg with high volatility ({margin_volatility:.1%})")
+else:
+details.append("Insufficient margin history")
+fcf_values = [item.free_cash_flow for item in financial_line_items
+if hasattr(item, 'free_cash_flow') and item.free_cash_flow is not None]
+if fcf_values and len(fcf_values) >= 5:
+positive_fcf_periods = sum(1 for fcf in fcf_values if fcf > 0)
+if positive_fcf_periods == len(fcf_values):
+score += 2
+details.append("Highly predictable cash generation: Positive FCF in all periods")
+elif positive_fcf_periods >= len(fcf_values) * 0.8:
+score += 1
+details.append(f"Predictable cash generation: Positive FCF in {positive_fcf_periods}/{len(fcf_values)} periods")
+else:
+details.append(f"Unpredictable cash generation: Positive FCF in only {positive_fcf_periods}/{len(fcf_values)} periods")
+else:
+details.append("Insufficient free cash flow history")
+final_score = min(10, score * 10 / 10)
+return {
+"score": final_score,
+"details": "; ".join(details)
+}
+def calculate_munger_valuation(financial_line_items: list, market_cap: float) -> dict:
+score = 0
+details = []
+if not financial_line_items or market_cap is None:
+return {
+"score": 0,
+"details": "Insufficient data to perform valuation"
+}
+fcf_values = [item.free_cash_flow for item in financial_line_items
+if hasattr(item, 'free_cash_flow') and item.free_cash_flow is not None]
+if not fcf_values or len(fcf_values) < 3:
+return {
+"score": 0,
+"details": "Insufficient free cash flow data for valuation"
+}
+normalized_fcf = sum(fcf_values[:min(5, len(fcf_values))]) / min(5, len(fcf_values))
+if normalized_fcf <= 0:
+return {
+"score": 0,
+"details": f"Negative or zero normalized FCF ({normalized_fcf}), cannot value",
+"intrinsic_value": None
+}
+fcf_yield = normalized_fcf / market_cap
+if fcf_yield > 0.08:
+score += 4
+details.append(f"Excellent value: {fcf_yield:.1%} FCF yield")
+elif fcf_yield > 0.05:
+score += 3
+details.append(f"Good value: {fcf_yield:.1%} FCF yield")
+elif fcf_yield > 0.03:
+score += 1
+details.append(f"Fair value: {fcf_yield:.1%} FCF yield")
+else:
+details.append(f"Expensive: Only {fcf_yield:.1%} FCF yield")
+conservative_value = normalized_fcf * 10
+reasonable_value = normalized_fcf * 15
+optimistic_value = normalized_fcf * 20
+current_to_reasonable = (reasonable_value - market_cap) / market_cap
+if current_to_reasonable > 0.3:
+score += 3
+details.append(f"Large margin of safety: {current_to_reasonable:.1%} upside to reasonable value")
+elif current_to_reasonable > 0.1:
+score += 2
+details.append(f"Moderate margin of safety: {current_to_reasonable:.1%} upside to reasonable value")
+elif current_to_reasonable > -0.1:
+score += 1
+details.append(f"Fair price: Within 10% of reasonable value ({current_to_reasonable:.1%})")
+else:
+details.append(f"Expensive: {-current_to_reasonable:.1%} premium to reasonable value")
+if len(fcf_values) >= 3:
+recent_avg = sum(fcf_values[:3]) / 3
+older_avg = sum(fcf_values[-3:]) / 3 if len(fcf_values) >= 6 else fcf_values[-1]
+if recent_avg > older_avg * 1.2:
+score += 3
+details.append("Growing FCF trend adds to intrinsic value")
+elif recent_avg > older_avg:
+score += 2
+details.append("Stable to growing FCF supports valuation")
+else:
+details.append("Declining FCF trend is concerning")
+final_score = min(10, score * 10 / 10)
+return {
+"score": final_score,
+"details": "; ".join(details),
+"intrinsic_value_range": {
+"conservative": conservative_value,
+"reasonable": reasonable_value,
+"optimistic": optimistic_value
+},
+"fcf_yield": fcf_yield,
+"normalized_fcf": normalized_fcf
+}
+def analyze_news_sentiment(news_items: list) -> str:
+if not news_items or len(news_items) == 0:
+return "No news data available"
+return f"Qualitative review of {len(news_items)} recent news items would be needed"
+def generate_munger_output(
+ticker: str,
+analysis_data: dict[str, any],
+model_name: str,
+model_provider: str,
+) -> CharlieMungerSignal:
+template = ChatPromptTemplate.from_messages([
+(
+"system",
+),
+(
+"human",
+)
+])
+prompt = template.invoke({
+"analysis_data": json.dumps(analysis_data, indent=2),
+"ticker": ticker
+})
+def create_default_charlie_munger_signal():
+return CharlieMungerSignal(
+signal="neutral",
+confidence=0.0,
+reasoning="Error in analysis, defaulting to neutral"
+)
+return call_llm(
+prompt=prompt,
+model_name=model_name,
+model_provider=model_provider,
+pydantic_model=CharlieMungerSignal,
+agent_name="charlie_munger_agent",
+default_factory=create_default_charlie_munger_signal,
+)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/ben_graham.py
+from langchain_openai import ChatOpenAI
+from graph.state import AgentState, show_agent_reasoning
+from tools.api import get_financial_metrics, get_market_cap, search_line_items
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+import json
+from typing_extensions import Literal
+from utils.progress import progress
+from utils.llm import call_llm
+import math
+class BenGrahamSignal(BaseModel):
+signal: Literal["bullish", "bearish", "neutral"]
+confidence: float
+reasoning: str
+def ben_graham_agent(state: AgentState):
+data = state["data"]
+end_date = data["end_date"]
+tickers = data["tickers"]
+analysis_data = {}
+graham_analysis = {}
+for ticker in tickers:
+progress.update_status("ben_graham_agent", ticker, "Fetching financial metrics")
+metrics = get_financial_metrics(ticker, end_date, period="annual", limit=10)
+progress.update_status("ben_graham_agent", ticker, "Gathering financial line items")
+financial_line_items = search_line_items(ticker, ["earnings_per_share", "revenue", "net_income", "book_value_per_share", "total_assets", "total_liabilities", "current_assets", "current_liabilities", "dividends_and_other_cash_distributions", "outstanding_shares"], end_date, period="annual", limit=10)
+progress.update_status("ben_graham_agent", ticker, "Getting market cap")
+market_cap = get_market_cap(ticker, end_date)
+progress.update_status("ben_graham_agent", ticker, "Analyzing earnings stability")
+earnings_analysis = analyze_earnings_stability(metrics, financial_line_items)
+progress.update_status("ben_graham_agent", ticker, "Analyzing financial strength")
+strength_analysis = analyze_financial_strength(metrics, financial_line_items)
+progress.update_status("ben_graham_agent", ticker, "Analyzing Graham valuation")
+valuation_analysis = analyze_valuation_graham(metrics, financial_line_items, market_cap)
+total_score = earnings_analysis["score"] + strength_analysis["score"] + valuation_analysis["score"]
+max_possible_score = 15
+if total_score >= 0.7 * max_possible_score:
+signal = "bullish"
+elif total_score <= 0.3 * max_possible_score:
+signal = "bearish"
+else:
+signal = "neutral"
+analysis_data[ticker] = {"signal": signal, "score": total_score, "max_score": max_possible_score, "earnings_analysis": earnings_analysis, "strength_analysis": strength_analysis, "valuation_analysis": valuation_analysis}
+progress.update_status("ben_graham_agent", ticker, "Generating Graham-style analysis")
+graham_output = generate_graham_output(
+ticker=ticker,
+analysis_data=analysis_data,
+model_name=state["metadata"]["model_name"],
+model_provider=state["metadata"]["model_provider"],
+)
+graham_analysis[ticker] = {"signal": graham_output.signal, "confidence": graham_output.confidence, "reasoning": graham_output.reasoning}
+progress.update_status("ben_graham_agent", ticker, "Done")
+message = HumanMessage(content=json.dumps(graham_analysis), name="ben_graham_agent")
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(graham_analysis, "Ben Graham Agent")
+state["data"]["analyst_signals"]["ben_graham_agent"] = graham_analysis
+return {"messages": [message], "data": state["data"]}
+def analyze_earnings_stability(metrics: list, financial_line_items: list) -> dict:
+score = 0
+details = []
+if not metrics or not financial_line_items:
+return {"score": score, "details": "Insufficient data for earnings stability analysis"}
+eps_vals = []
+for item in financial_line_items:
+if item.earnings_per_share is not None:
+eps_vals.append(item.earnings_per_share)
+if len(eps_vals) < 2:
+details.append("Not enough multi-year EPS data.")
+return {"score": score, "details": "; ".join(details)}
+positive_eps_years = sum(1 for e in eps_vals if e > 0)
+total_eps_years = len(eps_vals)
+if positive_eps_years == total_eps_years:
+score += 3
+details.append("EPS was positive in all available periods.")
+elif positive_eps_years >= (total_eps_years * 0.8):
+score += 2
+details.append("EPS was positive in most periods.")
+else:
+details.append("EPS was negative in multiple periods.")
+if eps_vals[-1] > eps_vals[0]:
+score += 1
+details.append("EPS grew from earliest to latest period.")
+else:
+details.append("EPS did not grow from earliest to latest period.")
+return {"score": score, "details": "; ".join(details)}
+def analyze_financial_strength(metrics: list, financial_line_items: list) -> dict:
+score = 0
+details = []
+if not financial_line_items:
+return {"score": score, "details": "No data for financial strength analysis"}
+latest_item = financial_line_items[-1]
+total_assets = latest_item.total_assets or 0
+total_liabilities = latest_item.total_liabilities or 0
+current_assets = latest_item.current_assets or 0
+current_liabilities = latest_item.current_liabilities or 0
+if current_liabilities > 0:
+current_ratio = current_assets / current_liabilities
+if current_ratio >= 2.0:
+score += 2
+details.append(f"Current ratio = {current_ratio:.2f} (>=2.0: solid).")
+elif current_ratio >= 1.5:
+score += 1
+details.append(f"Current ratio = {current_ratio:.2f} (moderately strong).")
+else:
+details.append(f"Current ratio = {current_ratio:.2f} (<1.5: weaker liquidity).")
+else:
+details.append("Cannot compute current ratio (missing or zero current_liabilities).")
+if total_assets > 0:
+debt_ratio = total_liabilities / total_assets
+if debt_ratio < 0.5:
+score += 2
+details.append(f"Debt ratio = {debt_ratio:.2f}, under 0.50 (conservative).")
+elif debt_ratio < 0.8:
+score += 1
+details.append(f"Debt ratio = {debt_ratio:.2f}, somewhat high but could be acceptable.")
+else:
+details.append(f"Debt ratio = {debt_ratio:.2f}, quite high by Graham standards.")
+else:
+details.append("Cannot compute debt ratio (missing total_assets).")
+div_periods = [item.dividends_and_other_cash_distributions for item in financial_line_items if item.dividends_and_other_cash_distributions is not None]
+if div_periods:
+div_paid_years = sum(1 for d in div_periods if d < 0)
+if div_paid_years > 0:
+if div_paid_years >= (len(div_periods) // 2 + 1):
+score += 1
+details.append("Company paid dividends in the majority of the reported years.")
+else:
+details.append("Company has some dividend payments, but not most years.")
+else:
+details.append("Company did not pay dividends in these periods.")
+else:
+details.append("No dividend data available to assess payout consistency.")
+return {"score": score, "details": "; ".join(details)}
+def analyze_valuation_graham(metrics: list, financial_line_items: list, market_cap: float) -> dict:
+if not financial_line_items or not market_cap or market_cap <= 0:
+return {"score": 0, "details": "Insufficient data to perform valuation"}
+latest = financial_line_items[-1]
+current_assets = latest.current_assets or 0
+total_liabilities = latest.total_liabilities or 0
+book_value_ps = latest.book_value_per_share or 0
+eps = latest.earnings_per_share or 0
+shares_outstanding = latest.outstanding_shares or 0
+details = []
+score = 0
+net_current_asset_value = current_assets - total_liabilities
+if net_current_asset_value > 0 and shares_outstanding > 0:
+net_current_asset_value_per_share = net_current_asset_value / shares_outstanding
+price_per_share = market_cap / shares_outstanding if shares_outstanding else 0
+details.append(f"Net Current Asset Value = {net_current_asset_value:,.2f}")
+details.append(f"NCAV Per Share = {net_current_asset_value_per_share:,.2f}")
+details.append(f"Price Per Share = {price_per_share:,.2f}")
+if net_current_asset_value > market_cap:
+score += 4
+details.append("Net-Net: NCAV > Market Cap (classic Graham deep value).")
+else:
+if net_current_asset_value_per_share >= (price_per_share * 0.67):
+score += 2
+details.append("NCAV Per Share >= 2/3 of Price Per Share (moderate net-net discount).")
+else:
+details.append("NCAV not exceeding market cap or insufficient data for net-net approach.")
+graham_number = None
+if eps > 0 and book_value_ps > 0:
+graham_number = math.sqrt(22.5 * eps * book_value_ps)
+details.append(f"Graham Number = {graham_number:.2f}")
+else:
+details.append("Unable to compute Graham Number (EPS or Book Value missing/<=0).")
+if graham_number and shares_outstanding > 0:
+current_price = market_cap / shares_outstanding
+if current_price > 0:
+margin_of_safety = (graham_number - current_price) / current_price
+details.append(f"Margin of Safety (Graham Number) = {margin_of_safety:.2%}")
+if margin_of_safety > 0.5:
+score += 3
+details.append("Price is well below Graham Number (>=50% margin).")
+elif margin_of_safety > 0.2:
+score += 1
+details.append("Some margin of safety relative to Graham Number.")
+else:
+details.append("Price close to or above Graham Number, low margin of safety.")
+else:
+details.append("Current price is zero or invalid; can't compute margin of safety.")
+return {"score": score, "details": "; ".join(details)}
+def generate_graham_output(
+ticker: str,
+analysis_data: dict[str, any],
+model_name: str,
+model_provider: str,
+) -> BenGrahamSignal:
+template = ChatPromptTemplate.from_messages([
+(
+"system",
+),
+(
+"human",
+)
+])
+prompt = template.invoke({
+"analysis_data": json.dumps(analysis_data, indent=2),
+"ticker": ticker
+})
+def create_default_ben_graham_signal():
+return BenGrahamSignal(signal="neutral", confidence=0.0, reasoning="Error in generating analysis; defaulting to neutral.")
+return call_llm(
+prompt=prompt,
+model_name=model_name,
+model_provider=model_provider,
+pydantic_model=BenGrahamSignal,
+agent_name="ben_graham_agent",
+default_factory=create_default_ben_graham_signal,
+)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/agents/risk_manager.py
+from langchain_core.messages import HumanMessage
+from graph.state import AgentState, show_agent_reasoning
+from utils.progress import progress
+from tools.api import get_prices, prices_to_df
+import json
+def risk_management_agent(state: AgentState):
+portfolio = state["data"]["portfolio"]
+data = state["data"]
+tickers = data["tickers"]
+risk_analysis = {}
+current_prices = {}
+for ticker in tickers:
+progress.update_status("risk_management_agent", ticker, "Analyzing price data")
+prices = get_prices(
+ticker=ticker,
+start_date=data["start_date"],
+end_date=data["end_date"],
+)
+if not prices:
+progress.update_status("risk_management_agent", ticker, "Failed: No price data found")
+continue
+prices_df = prices_to_df(prices)
+progress.update_status("risk_management_agent", ticker, "Calculating position limits")
+current_price = prices_df["close"].iloc[-1]
+current_prices[ticker] = current_price
+current_position_value = portfolio.get("cost_basis", {}).get(ticker, 0)
+total_portfolio_value = portfolio.get("cash", 0) + sum(portfolio.get("cost_basis", {}).get(t, 0) for t in portfolio.get("cost_basis", {}))
+position_limit = total_portfolio_value * 0.20
+remaining_position_limit = position_limit - current_position_value
+max_position_size = min(remaining_position_limit, portfolio.get("cash", 0))
+risk_analysis[ticker] = {
+"remaining_position_limit": float(max_position_size),
+"current_price": float(current_price),
+"reasoning": {
+"portfolio_value": float(total_portfolio_value),
+"current_position": float(current_position_value),
+"position_limit": float(position_limit),
+"remaining_limit": float(remaining_position_limit),
+"available_cash": float(portfolio.get("cash", 0)),
+},
+}
+progress.update_status("risk_management_agent", ticker, "Done")
+message = HumanMessage(
+content=json.dumps(risk_analysis),
+name="risk_management_agent",
+)
+if state["metadata"]["show_reasoning"]:
+show_agent_reasoning(risk_analysis, "Risk Management Agent")
+state["data"]["analyst_signals"]["risk_management_agent"] = risk_analysis
+return {
+"messages": state["messages"] + [message],
+"data": data,
+}
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/utils/__init__.py
+
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/utils/llm.py
+import json
+from typing import TypeVar, Type, Optional, Any
+from pydantic import BaseModel
+from utils.progress import progress
+T = TypeVar('T', bound=BaseModel)
+def call_llm(
+prompt: Any,
+model_name: str,
+model_provider: str,
+pydantic_model: Type[T],
+agent_name: Optional[str] = None,
+max_retries: int = 3,
+default_factory = None
+) -> T:
+from llm.models import get_model, get_model_info
+model_info = get_model_info(model_name)
+llm = get_model(model_name, model_provider)
+if not (model_info and model_info.is_deepseek()):
+llm = llm.with_structured_output(
+pydantic_model,
+method="json_mode",
+)
+for attempt in range(max_retries):
+try:
+result = llm.invoke(prompt)
+if model_info and model_info.is_deepseek():
+parsed_result = extract_json_from_deepseek_response(result.content)
+if parsed_result:
+return pydantic_model(**parsed_result)
+else:
+return result
+except Exception as e:
+if agent_name:
+progress.update_status(agent_name, None, f"Error - retry {attempt + 1}/{max_retries}")
+if attempt == max_retries - 1:
+print(f"Error in LLM call after {max_retries} attempts: {e}")
+if default_factory:
+return default_factory()
+return create_default_response(pydantic_model)
+return create_default_response(pydantic_model)
+def create_default_response(model_class: Type[T]) -> T:
+default_values = {}
+for field_name, field in model_class.model_fields.items():
+if field.annotation == str:
+default_values[field_name] = "Error in analysis, using default"
+elif field.annotation == float:
+default_values[field_name] = 0.0
+elif field.annotation == int:
+default_values[field_name] = 0
+elif hasattr(field.annotation, "__origin__") and field.annotation.__origin__ == dict:
+default_values[field_name] = {}
+else:
+if hasattr(field.annotation, "__args__"):
+default_values[field_name] = field.annotation.__args__[0]
+else:
+default_values[field_name] = None
+return model_class(**default_values)
+def extract_json_from_deepseek_response(content: str) -> Optional[dict]:
+try:
+json_start = content.find("```json")
+if json_start != -1:
+json_text = content[json_start + 7:]
+json_end = json_text.find("```")
+if json_end != -1:
+json_text = json_text[:json_end].strip()
+return json.loads(json_text)
+except Exception as e:
+print(f"Error extracting JSON from Deepseek response: {e}")
+return None
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/utils/visualize.py
+from langgraph.graph.state import CompiledGraph
+from langchain_core.runnables.graph import MermaidDrawMethod
+def save_graph_as_png(app: CompiledGraph, output_file_path) -> None:
+png_image = app.get_graph().draw_mermaid_png(draw_method=MermaidDrawMethod.API)
+file_path = output_file_path if len(output_file_path) > 0 else "graph.png"
+with open(file_path, "wb") as f:
+f.write(png_image)
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/utils/display.py
+from colorama import Fore, Style
+from tabulate import tabulate
+from .analysts import ANALYST_ORDER
+import os
+def sort_analyst_signals(signals):
+analyst_order = {display: idx for idx, (display, _) in enumerate(ANALYST_ORDER)}
+analyst_order["Risk Management"] = len(ANALYST_ORDER)
+return sorted(signals, key=lambda x: analyst_order.get(x[0], 999))
+def print_trading_output(result: dict) -> None:
+decisions = result.get("decisions")
+if not decisions:
+print(f"{Fore.RED}No trading decisions available{Style.RESET_ALL}")
+return
+for ticker, decision in decisions.items():
+print(f"\n{Fore.WHITE}{Style.BRIGHT}Analysis for {Fore.CYAN}{ticker}{Style.RESET_ALL}")
+print(f"{Fore.WHITE}{Style.BRIGHT}{'=' * 50}{Style.RESET_ALL}")
+table_data = []
+for agent, signals in result.get("analyst_signals", {}).items():
+if ticker not in signals:
+continue
+signal = signals[ticker]
+agent_name = agent.replace("_agent", "").replace("_", " ").title()
+signal_type = signal.get("signal", "").upper()
+signal_color = {
+"BULLISH": Fore.GREEN,
+"BEARISH": Fore.RED,
+"NEUTRAL": Fore.YELLOW,
+}.get(signal_type, Fore.WHITE)
+table_data.append(
+[
+f"{Fore.CYAN}{agent_name}{Style.RESET_ALL}",
+f"{signal_color}{signal_type}{Style.RESET_ALL}",
+f"{Fore.YELLOW}{signal.get('confidence')}%{Style.RESET_ALL}",
+]
+)
+table_data = sort_analyst_signals(table_data)
+print(f"\n{Fore.WHITE}{Style.BRIGHT}ANALYST SIGNALS:{Style.RESET_ALL} [{Fore.CYAN}{ticker}{Style.RESET_ALL}]")
+print(
+tabulate(
+table_data,
+headers=[f"{Fore.WHITE}Analyst", "Signal", "Confidence"],
+tablefmt="grid",
+colalign=("left", "center", "right"),
+)
+)
+action = decision.get("action", "").upper()
+action_color = {"BUY": Fore.GREEN, "SELL": Fore.RED, "HOLD": Fore.YELLOW}.get(action, Fore.WHITE)
+decision_data = [
+["Action", f"{action_color}{action}{Style.RESET_ALL}"],
+["Quantity", f"{action_color}{decision.get('quantity')}{Style.RESET_ALL}"],
+[
+"Confidence",
+f"{Fore.YELLOW}{decision.get('confidence'):.1f}%{Style.RESET_ALL}",
+],
+]
+print(f"\n{Fore.WHITE}{Style.BRIGHT}TRADING DECISION:{Style.RESET_ALL} [{Fore.CYAN}{ticker}{Style.RESET_ALL}]")
+print(tabulate(decision_data, tablefmt="grid", colalign=("left", "right")))
+print(f"\n{Fore.WHITE}{Style.BRIGHT}Reasoning:{Style.RESET_ALL} {Fore.CYAN}{decision.get('reasoning')}{Style.RESET_ALL}")
+print(f"\n{Fore.WHITE}{Style.BRIGHT}PORTFOLIO SUMMARY:{Style.RESET_ALL}")
+portfolio_data = []
+for ticker, decision in decisions.items():
+action = decision.get("action", "").upper()
+action_color = {
+"BUY": Fore.GREEN,
+"SELL": Fore.RED,
+"HOLD": Fore.YELLOW,
+"COVER": Fore.GREEN,
+"SHORT": Fore.RED,
+}.get(action, Fore.WHITE)
+portfolio_data.append(
+[
+f"{Fore.CYAN}{ticker}{Style.RESET_ALL}",
+f"{action_color}{action}{Style.RESET_ALL}",
+f"{action_color}{decision.get('quantity')}{Style.RESET_ALL}",
+f"{Fore.YELLOW}{decision.get('confidence'):.1f}%{Style.RESET_ALL}",
+]
+)
+print(
+tabulate(
+portfolio_data,
+headers=[f"{Fore.WHITE}Ticker", "Action", "Quantity", "Confidence"],
+tablefmt="grid",
+colalign=("left", "center", "right", "right"),
+)
+)
+def print_backtest_results(table_rows: list) -> None:
+os.system("cls" if os.name == "nt" else "clear")
+ticker_rows = []
+summary_rows = []
+for row in table_rows:
+if isinstance(row[1], str) and "PORTFOLIO SUMMARY" in row[1]:
+summary_rows.append(row)
+else:
+ticker_rows.append(row)
+if summary_rows:
+latest_summary = summary_rows[-1]
+print(f"\n{Fore.WHITE}{Style.BRIGHT}PORTFOLIO SUMMARY:{Style.RESET_ALL}")
+cash_str = latest_summary[7].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
+position_str = latest_summary[6].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
+total_str = latest_summary[8].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
+print(f"Cash Balance: {Fore.CYAN}${float(cash_str):,.2f}{Style.RESET_ALL}")
+print(f"Total Position Value: {Fore.YELLOW}${float(position_str):,.2f}{Style.RESET_ALL}")
+print(f"Total Value: {Fore.WHITE}${float(total_str):,.2f}{Style.RESET_ALL}")
+print(f"Return: {latest_summary[9]}")
+if latest_summary[10]:
+print(f"Sharpe Ratio: {latest_summary[10]}")
+if latest_summary[11]:
+print(f"Sortino Ratio: {latest_summary[11]}")
+if latest_summary[12]:
+print(f"Max Drawdown: {latest_summary[12]}")
+print("\n" * 2)
+print(
+tabulate(
+ticker_rows,
+headers=[
+"Date",
+"Ticker",
+"Action",
+"Quantity",
+"Price",
+"Shares",
+"Position Value",
+"Bullish",
+"Bearish",
+"Neutral",
+],
+tablefmt="grid",
+colalign=(
+"left",
+"left",
+"center",
+"right",
+"right",
+"right",
+"right",
+"right",
+"right",
+"right",
+),
+)
+)
+print("\n" * 4)
+def format_backtest_row(
+date: str,
+ticker: str,
+action: str,
+quantity: float,
+price: float,
+shares_owned: float,
+position_value: float,
+bullish_count: int,
+bearish_count: int,
+neutral_count: int,
+is_summary: bool = False,
+total_value: float = None,
+return_pct: float = None,
+cash_balance: float = None,
+total_position_value: float = None,
+sharpe_ratio: float = None,
+sortino_ratio: float = None,
+max_drawdown: float = None,
+) -> list[any]:
+action_color = {
+"BUY": Fore.GREEN,
+"COVER": Fore.GREEN,
+"SELL": Fore.RED,
+"SHORT": Fore.RED,
+"HOLD": Fore.YELLOW,
+}.get(action.upper(), Fore.WHITE)
+if is_summary:
+return_color = Fore.GREEN if return_pct >= 0 else Fore.RED
+return [
+date,
+f"{Fore.WHITE}{Style.BRIGHT}PORTFOLIO SUMMARY{Style.RESET_ALL}",
+"",
+"",
+"",
+"",
+f"{Fore.YELLOW}${total_position_value:,.2f}{Style.RESET_ALL}",
+f"{Fore.CYAN}${cash_balance:,.2f}{Style.RESET_ALL}",
+f"{Fore.WHITE}${total_value:,.2f}{Style.RESET_ALL}",
+f"{return_color}{return_pct:+.2f}%{Style.RESET_ALL}",
+f"{Fore.YELLOW}{sharpe_ratio:.2f}{Style.RESET_ALL}" if sharpe_ratio is not None else "",
+f"{Fore.YELLOW}{sortino_ratio:.2f}{Style.RESET_ALL}" if sortino_ratio is not None else "",
+f"{Fore.RED}{max_drawdown:.2f}%{Style.RESET_ALL}" if max_drawdown is not None else "",
+]
+else:
+return [
+date,
+f"{Fore.CYAN}{ticker}{Style.RESET_ALL}",
+f"{action_color}{action.upper()}{Style.RESET_ALL}",
+f"{action_color}{quantity:,.0f}{Style.RESET_ALL}",
+f"{Fore.WHITE}{price:,.2f}{Style.RESET_ALL}",
+f"{Fore.WHITE}{shares_owned:,.0f}{Style.RESET_ALL}",
+f"{Fore.YELLOW}{position_value:,.2f}{Style.RESET_ALL}",
+f"{Fore.GREEN}{bullish_count}{Style.RESET_ALL}",
+f"{Fore.RED}{bearish_count}{Style.RESET_ALL}",
+f"{Fore.BLUE}{neutral_count}{Style.RESET_ALL}",
+]
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/utils/progress.py
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.style import Style
+from rich.text import Text
+from typing import Dict, Optional
+from datetime import datetime
+console = Console()
+class AgentProgress:
+def __init__(self):
+self.agent_status: Dict[str, Dict[str, str]] = {}
+self.table = Table(show_header=False, box=None, padding=(0, 1))
+self.live = Live(self.table, console=console, refresh_per_second=4)
+self.started = False
+def start(self):
+if not self.started:
+self.live.start()
+self.started = True
+def stop(self):
+if self.started:
+self.live.stop()
+self.started = False
+def update_status(self, agent_name: str, ticker: Optional[str] = None, status: str = ""):
+if agent_name not in self.agent_status:
+self.agent_status[agent_name] = {"status": "", "ticker": None}
+if ticker:
+self.agent_status[agent_name]["ticker"] = ticker
+if status:
+self.agent_status[agent_name]["status"] = status
+self._refresh_display()
+def _refresh_display(self):
+self.table.columns.clear()
+self.table.add_column(width=100)
+def sort_key(item):
+agent_name = item[0]
+if "risk_management" in agent_name:
+return (2, agent_name)
+elif "portfolio_management" in agent_name:
+return (3, agent_name)
+else:
+return (1, agent_name)
+for agent_name, info in sorted(self.agent_status.items(), key=sort_key):
+status = info["status"]
+ticker = info["ticker"]
+if status.lower() == "done":
+style = Style(color="green", bold=True)
+symbol = "✓"
+elif status.lower() == "error":
+style = Style(color="red", bold=True)
+symbol = "✗"
+else:
+style = Style(color="yellow")
+symbol = "⋯"
+agent_display = agent_name.replace("_agent", "").replace("_", " ").title()
+status_text = Text()
+status_text.append(f"{symbol} ", style=style)
+status_text.append(f"{agent_display:<20}", style=Style(bold=True))
+if ticker:
+status_text.append(f"[{ticker}] ", style=Style(color="cyan"))
+status_text.append(status, style=style)
+self.table.add_row(status_text)
+progress = AgentProgress()
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/utils/analysts.py
+from agents.ben_graham import ben_graham_agent
+from agents.bill_ackman import bill_ackman_agent
+from agents.cathie_wood import cathie_wood_agent
+from agents.charlie_munger import charlie_munger_agent
+from agents.fundamentals import fundamentals_agent
+from agents.sentiment import sentiment_agent
+from agents.technicals import technical_analyst_agent
+from agents.valuation import valuation_agent
+from agents.warren_buffett import warren_buffett_agent
+ANALYST_CONFIG = {
+"ben_graham": {
+"display_name": "Ben Graham",
+"agent_func": ben_graham_agent,
+"order": 0,
+},
+"bill_ackman": {
+"display_name": "Bill Ackman",
+"agent_func": bill_ackman_agent,
+"order": 1,
+},
+"cathie_wood": {
+"display_name": "Cathie Wood",
+"agent_func": cathie_wood_agent,
+"order": 2,
+},
+"charlie_munger": {
+"display_name": "Charlie Munger",
+"agent_func": charlie_munger_agent,
+"order": 3,
+},
+"warren_buffett": {
+"display_name": "Warren Buffett",
+"agent_func": warren_buffett_agent,
+"order": 4,
+},
+"technical_analyst": {
+"display_name": "Technical Analyst",
+"agent_func": technical_analyst_agent,
+"order": 4,
+},
+"fundamentals_analyst": {
+"display_name": "Fundamentals Analyst",
+"agent_func": fundamentals_agent,
+"order": 5,
+},
+"sentiment_analyst": {
+"display_name": "Sentiment Analyst",
+"agent_func": sentiment_agent,
+"order": 6,
+},
+"valuation_analyst": {
+"display_name": "Valuation Analyst",
+"agent_func": valuation_agent,
+"order": 7,
+},
+}
+ANALYST_ORDER = [(config["display_name"], key) for key, config in sorted(ANALYST_CONFIG.items(), key=lambda x: x[1]["order"])]
+def get_analyst_nodes():
+return {key: (f"{key}_agent", config["agent_func"]) for key, config in ANALYST_CONFIG.items()}
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/data/models.py
+from pydantic import BaseModel
+class Price(BaseModel):
+open: float
+close: float
+high: float
+low: float
+volume: int
+time: str
+class PriceResponse(BaseModel):
+ticker: str
+prices: list[Price]
+class FinancialMetrics(BaseModel):
+ticker: str
+report_period: str
+period: str
+currency: str
+market_cap: float | None
+enterprise_value: float | None
+price_to_earnings_ratio: float | None
+price_to_book_ratio: float | None
+price_to_sales_ratio: float | None
+enterprise_value_to_ebitda_ratio: float | None
+enterprise_value_to_revenue_ratio: float | None
+free_cash_flow_yield: float | None
+peg_ratio: float | None
+gross_margin: float | None
+operating_margin: float | None
+net_margin: float | None
+return_on_equity: float | None
+return_on_assets: float | None
+return_on_invested_capital: float | None
+asset_turnover: float | None
+inventory_turnover: float | None
+receivables_turnover: float | None
+days_sales_outstanding: float | None
+operating_cycle: float | None
+working_capital_turnover: float | None
+current_ratio: float | None
+quick_ratio: float | None
+cash_ratio: float | None
+operating_cash_flow_ratio: float | None
+debt_to_equity: float | None
+debt_to_assets: float | None
+interest_coverage: float | None
+revenue_growth: float | None
+earnings_growth: float | None
+book_value_growth: float | None
+earnings_per_share_growth: float | None
+free_cash_flow_growth: float | None
+operating_income_growth: float | None
+ebitda_growth: float | None
+payout_ratio: float | None
+earnings_per_share: float | None
+book_value_per_share: float | None
+free_cash_flow_per_share: float | None
+class FinancialMetricsResponse(BaseModel):
+financial_metrics: list[FinancialMetrics]
+class LineItem(BaseModel):
+ticker: str
+report_period: str
+period: str
+currency: str
+model_config = {"extra": "allow"}
+class LineItemResponse(BaseModel):
+search_results: list[LineItem]
+class InsiderTrade(BaseModel):
+ticker: str
+issuer: str | None
+name: str | None
+title: str | None
+is_board_director: bool | None
+transaction_date: str | None
+transaction_shares: float | None
+transaction_price_per_share: float | None
+transaction_value: float | None
+shares_owned_before_transaction: float | None
+shares_owned_after_transaction: float | None
+security_title: str | None
+filing_date: str
+class InsiderTradeResponse(BaseModel):
+insider_trades: list[InsiderTrade]
+class CompanyNews(BaseModel):
+ticker: str
+title: str
+author: str
+source: str
+date: str
+url: str
+sentiment: str | None = None
+class CompanyNewsResponse(BaseModel):
+news: list[CompanyNews]
+class Position(BaseModel):
+cash: float = 0.0
+shares: int = 0
+ticker: str
+class Portfolio(BaseModel):
+positions: dict[str, Position]
+total_cash: float = 0.0
+class AnalystSignal(BaseModel):
+signal: str | None = None
+confidence: float | None = None
+reasoning: dict | str | None = None
+max_position_size: float | None = None
+class TickerAnalysis(BaseModel):
+ticker: str
+analyst_signals: dict[str, AnalystSignal]
+class AgentStateData(BaseModel):
+tickers: list[str]
+portfolio: Portfolio
+start_date: str
+end_date: str
+ticker_analyses: dict[str, TickerAnalysis]
+class AgentStateMetadata(BaseModel):
+show_reasoning: bool = False
+model_config = {"extra": "allow"}
+
+# File: /Users/lukebyrne/Code/finance/ai-hedge-fund/src/data/cache.py
+class Cache:
+def __init__(self):
+self._prices_cache: dict[str, list[dict[str, any]]] = {}
+self._financial_metrics_cache: dict[str, list[dict[str, any]]] = {}
+self._line_items_cache: dict[str, list[dict[str, any]]] = {}
+self._insider_trades_cache: dict[str, list[dict[str, any]]] = {}
+self._company_news_cache: dict[str, list[dict[str, any]]] = {}
+def _merge_data(self, existing: list[dict] | None, new_data: list[dict], key_field: str) -> list[dict]:
+if not existing:
+return new_data
+existing_keys = {item[key_field] for item in existing}
+merged = existing.copy()
+merged.extend([item for item in new_data if item[key_field] not in existing_keys])
+return merged
+def get_prices(self, ticker: str) -> list[dict[str, any]] | None:
+return self._prices_cache.get(ticker)
+def set_prices(self, ticker: str, data: list[dict[str, any]]):
+self._prices_cache[ticker] = self._merge_data(
+self._prices_cache.get(ticker),
+data,
+key_field="time"
+)
+def get_financial_metrics(self, ticker: str) -> list[dict[str, any]]:
+return self._financial_metrics_cache.get(ticker)
+def set_financial_metrics(self, ticker: str, data: list[dict[str, any]]):
+self._financial_metrics_cache[ticker] = self._merge_data(
+self._financial_metrics_cache.get(ticker),
+data,
+key_field="report_period"
+)
+def get_line_items(self, ticker: str) -> list[dict[str, any]] | None:
+return self._line_items_cache.get(ticker)
+def set_line_items(self, ticker: str, data: list[dict[str, any]]):
+self._line_items_cache[ticker] = self._merge_data(
+self._line_items_cache.get(ticker),
+data,
+key_field="report_period"
+)
+def get_insider_trades(self, ticker: str) -> list[dict[str, any]] | None:
+return self._insider_trades_cache.get(ticker)
+def set_insider_trades(self, ticker: str, data: list[dict[str, any]]):
+self._insider_trades_cache[ticker] = self._merge_data(
+self._insider_trades_cache.get(ticker),
+data,
+key_field="filing_date"
+)
+def get_company_news(self, ticker: str) -> list[dict[str, any]] | None:
+return self._company_news_cache.get(ticker)
+def set_company_news(self, ticker: str, data: list[dict[str, any]]):
+self._company_news_cache[ticker] = self._merge_data(
+self._company_news_cache.get(ticker),
+data,
+key_field="date"
+)
+_cache = Cache()
+def get_cache() -> Cache:
+return _cache
+
