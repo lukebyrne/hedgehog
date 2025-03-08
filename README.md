@@ -1,165 +1,100 @@
-# Hedgehog AI Hedge Fund
+# 🦔 Hedgehog AI Hedge Fund
 
-![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![OpenRouter](https://img.shields.io/badge/API-OpenRouter-orange.svg)
-![Status: Development](https://img.shields.io/badge/Status-Development-green.svg)
+Hedgehog is an AI-powered hedge fund analysis system that combines multiple AI analyst perspectives to provide comprehensive investment recommendations. It's designed to help investors make more informed decisions by aggregating insights from various investment styles and methodologies.
 
-An AI-powered hedge fund analysis platform that uses charts and personas to analyze the 200 biggest companies on US markets and generate a list of potential investment long/short opportunities.
+## Features
 
-## 📊 Overview
+- **Multiple AI Analysts**: Get insights from AI analysts modeled after famous investors (Warren Buffett, Charlie Munger, Bill Ackman, Ben Graham, Cathie Wood)
+- **Comprehensive Analysis**: Technical, fundamental, sentiment, and valuation perspectives combined into a single coherent recommendation
+- **Backtesting**: Test strategies against historical data to evaluate performance
+- **Modern AI Models**: Uses OpenRouter API to access the latest AI models from OpenAI, Anthropic, and more
+- **Interactive CLI**: Choose your analysts and models through an intuitive command-line interface
+- **Real-time Progress Tracking**: Monitor the analysis process with detailed progress tracking
 
-Hedgehog uses a graph-based workflow powered by Pydantic AI with agent functions and OpenRouter to simulate a complete investment analysis process. The system employs multiple specialized agents, each focusing on different aspects of company analysis:
+## Requirements
 
-1. **Fundamental Analysis Agent** - Evaluates company financials and business health
-2. **Technical Analysis Agent** - Analyzes price patterns and technical indicators
-3. **Sentiment Analysis Agent** - Assesses market sentiment from news and social media
-4. **Valuation Analysis Agent** - Calculates intrinsic value using DCF and comparable methods
-5. **Warren Buffett Agent** - Applies Warren Buffett's investment principles
-6. **Bill Ackman Agent** - Applies Bill Ackman's investment principles
-7. **Risk Manager Agent** - Evaluates position and portfolio risk
-8. **Portfolio Manager Agent** - Makes final investment decisions
+- Python 3.10+
+- OpenRouter API key (for accessing AI models)
+- Financial Datasets API key (for market data)
 
-The analysis workflow is orchestrated through Pydantic AI's Graph feature, which creates a directed graph of analysis steps, automatically handling the flow of data between agents.
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Python 3.12+
-- [uv](https://github.com/astral-sh/uv) (modern Python package installer)
-
-### Setup
+## Installation
 
 1. Clone the repository:
-"""
+```bash
 git clone https://github.com/yourusername/hedgehog.git
 cd hedgehog
-"""
+```
 
 2. Create a virtual environment and install dependencies:
-"""
+```bash
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-uv pip install -e .
-"""
+pip install -e .
+```
 
-3. Set up environment variables by creating a `.env` file with your API keys:
-"""
+3. Create a `.env` file with your API keys:
+```
 OPENROUTER_API_KEY=your_openrouter_api_key
-FINANCIAL_DATASETS_API_KEY=your_financial_data_api_key
-CHART_IMG_API_KEY=your_chart_image_api_key
-LOGFIRE_TOKEN=your_logfire_token
-STAGE=dev
-"""
+FINANCIAL_DATASETS_API_KEY=your_financial_datasets_api_key
+HEDGEHOG_DARK_MODE=0  # Set to 1 for dark mode
+```
 
-## 🖥️ Usage
+## Usage
 
 ### Analyzing Stocks
 
-To analyze a single stock or a list of stocks:
+To analyze one or more stocks:
 
-"""
-python -m hedgehog.main analyze AAPL MSFT GOOGL
-"""
+```bash
+python -m hedgehog.main analyze AAPL MSFT GOOGL --interactive
+```
 
-This will run a comprehensive analysis for each ticker and provide investment recommendations.
-
-Optional parameters:
-- `--model`: Specify a different model for analysis (default: anthropic/claude-3.5-sonnet)
+Options:
+- `--interactive`: Use interactive CLI to select analysts and models
+- `--model`: Specify a model directly (e.g., `--model="anthropic/claude-3.5-sonnet"`)
+- `--show-reasoning`: Show detailed reasoning from each analyst
 
 ### Running a Backtest
 
-To backtest the AI hedge fund strategy on historical data:
+To run a historical backtest:
 
-"""
-python -m hedgehog.main backtest AAPL MSFT GOOGL AMZN NVDA --start 2023-01-01 --end 2023-12-31
-"""
+```bash
+python -m hedgehog.main backtest AAPL MSFT GOOGL --start=2022-01-01 --end=2023-01-01 --capital=1000000
+```
 
-Optional parameters:
-- `--capital`: Initial capital (default: $1,000,000)
-- `--max-positions`: Maximum number of positions allowed (default: 10)
-- `--position-size`: Maximum position size as percentage (default: 10.0%)
+Options:
+- `--start`: Start date (YYYY-MM-DD)
+- `--end`: End date (YYYY-MM-DD)
+- `--capital`: Initial capital (default: 1,000,000)
+- `--max-positions`: Maximum number of positions (default: 10)
+- `--position-size`: Maximum position size as percentage (default: 10.0)
 - `--rebalance`: Rebalance frequency in days (default: 30)
-- `--no-stop-loss`: Disable stop-loss for positions
+- `--no-stop-loss`: Disable stop-loss
 
-## 📂 Project Structure
+## Available Analysts
 
-"""
-hedgehog/
-├── agents/                   # Specialized analysis agents
-│   ├── bill_ackman.py        # Bill Ackman investment agent
-│   ├── fundamentals.py       # Fundamental analysis agent
-│   ├── portfolio_manager.py  # Portfolio management agent
-│   ├── risk_manager.py       # Risk management agent
-│   ├── sentiment.py          # Sentiment analysis agent
-│   ├── technicals.py         # Technical analysis agent
-│   ├── valuation.py          # Valuation analysis agent
-│   └── warren_buffett.py     # Warren Buffett investment agent
-├── tools/                    # API tools for data access
-│   └── api.py                # API client tools
-├── backtester.py             # Backtesting tools
-├── graph_workflow.py         # Pydantic AI Graph workflow
-├── logfire_setup.py          # Logging configuration
-├── main.py                   # CLI entry point
-└── predict.py                # Basic prediction module
-"""
+- **Warren Buffett**: Value investing with focus on moats and long-term business quality
+- **Charlie Munger**: Mental models and multidisciplinary thinking
+- **Bill Ackman**: Activist investing approach with focus on high-quality businesses
+- **Ben Graham**: Classical value investing using strict quantitative criteria
+- **Cathie Wood**: Innovation-focused investing with emphasis on disruptive technologies
+- **Fundamentals Analyst**: Pure financial fundamental analysis
+- **Technical Analyst**: Price action and technical indicators
+- **Sentiment Analyst**: News, social media, and market sentiment
+- **Valuation Analyst**: Detailed intrinsic value calculations
 
-## 🏗️ Technical Architecture
+## Available Models
 
-### Pydantic AI Graph Workflow
+Hedgehog uses OpenRouter to access models from multiple providers:
 
-The core of the system is built on Pydantic AI's Graph feature, which creates a directed graph workflow:
+- OpenAI: GPT-4o, o1, o1-mini, etc.
+- Anthropic: Claude 3.5 Sonnet, Claude 3.7 Sonnet, etc.
+- DeepSeek: DeepSeek R1 Distill LLaMa 70B, etc.
 
-1. **Data Fetching Nodes** - Fetch company, price history, news, and peer data
-2. **Analysis Nodes** - Run specialized agent functions for different analysis types
-3. **Decision Nodes** - Synthesize all analyses into an investment decision
-4. **Compilation Nodes** - Combine all results into a comprehensive output
-
-Each node in the graph is a Pydantic AI-powered function that leverages large language models through OpenRouter to perform specific parts of the analysis.
-
-### Pydantic Models
-
-The system uses strongly-typed Pydantic models throughout to ensure data consistency and validation:
-
-1. Analysis result models for each agent type
-2. Investment decision models
-3. Backtest models for simulating performance
-
-### OpenRouter Integration
-
-Models are accessed through OpenRouter, allowing flexibility to use different LLM providers:
-
-1. OpenAI models (e.g., GPT-4)
-2. Anthropic models (e.g., Claude 3)
-3. Other providers supported by OpenRouter
-
-## 📈 Features
-
-- **Multi-Agent Analysis**: Employs specialized agents for comprehensive investment analysis
-- **Graph-Based Workflow**: Orchestrates complex analysis processes efficiently
-- **Backtesting**: Test investment strategies against historical data
-- **Model Flexibility**: Switch between different LLM providers via OpenRouter
-- **Strongly-Typed**: Uses Pydantic models throughout for robust data handling
-
-## ⚠️ Disclaimer
-
-This project is for educational and research purposes only and is not intended for real trading. The AI-generated investment recommendations should not be considered financial advice. Always consult with a qualified financial advisor before making investment decisions.
-
-## 📄 License
-
-MIT
-
-## 👏 Credits
-
-Inspired by [virattt/ai-hedge-fund](https://github.com/virattt/ai-hedge-fund)
-
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.

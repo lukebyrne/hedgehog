@@ -77,8 +77,6 @@ async def fetch_news_data(ticker: str, limit: int = 20) -> List[Dict[str, Any]]:
     Returns:
         List of recent news articles
     """
-    # This is a placeholder. In a real implementation, you would call actual
-    # news APIs here.
 
     async with aiohttp.ClientSession() as session:
         news_url = f"https://financialdatasets.ai/api/v1/news/{ticker}?limit={limit}&apikey={FINANCIAL_DATASETS_API_KEY}"

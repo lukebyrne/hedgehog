@@ -1,64 +1,59 @@
-"""Risk manager agent for evaluating and managing portfolio risk."""
+"""Risk manager agent that assesses investment risks and exposure."""
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 from pydantic_ai import agent
 
 
-class PositionRisk(BaseModel):
-    """Risk assessment for an individual position."""
+class RiskMetrics(BaseModel):
+    """Key risk metrics for a potential investment."""
+
+    volatility: float = Field(..., description="Historical price volatility")
+    maximum_drawdown: float = Field(..., description="Maximum historical drawdown")
+    value_at_risk: float = Field(..., description="Value at Risk (95% confidence)")
+    beta: float = Field(..., description="Beta relative to market")
+    correlation_to_spy: float = Field(..., description="Correlation to S&P 500")
+    sharpe_ratio: float = Field(..., description="Risk-adjusted return measure")
+    sortino_ratio: float = Field(..., description="Downside risk-adjusted return measure")
+
+
+class RiskLimits(BaseModel):
+    """Risk limits and constraints for portfolio management."""
+
+    position_limit: float = Field(..., description="Maximum position size as percentage of portfolio")
+    stop_loss_level: float = Field(..., description="Recommended stop loss percentage")
+    max_sector_exposure: float = Field(..., description="Maximum sector exposure percentage")
+    max_beta_exposure: float = Field(..., description="Maximum portfolio beta target")
+    max_drawdown_tolerance: float = Field(..., description="Maximum drawdown tolerance")
+
+
+class RiskAssessment(BaseModel):
+    """Comprehensive risk assessment for a potential investment."""
 
     ticker: str = Field(..., description="Stock ticker symbol")
-    beta: float = Field(..., description="Beta coefficient (market risk)")
-    volatility: float = Field(..., description="Historical price volatility")
-    value_at_risk: float = Field(..., description="Value at Risk (VaR) at 95% confidence")
-    max_drawdown: float = Field(..., description="Maximum historical drawdown")
-    correlation_to_portfolio: Optional[float] = Field(None, description="Correlation to existing portfolio")
-    position_limit: float = Field(..., description="Maximum recommended position size (%)")
-    risk_factors: List[str] = Field(..., description="Specific risk factors identified")
-
-
-class PortfolioRisk(BaseModel):
-    """Comprehensive portfolio risk assessment."""
-
-    total_positions: int = Field(..., description="Total number of positions")
-    portfolio_beta: float = Field(..., description="Overall portfolio beta")
-    portfolio_volatility: float = Field(..., description="Overall portfolio volatility")
-    portfolio_var: float = Field(..., description="Portfolio Value at Risk (VaR) at 95% confidence")
-    sharpe_ratio: float = Field(..., description="Expected Sharpe ratio")
-    concentration_risk: str = Field(..., description="Assessment of concentration risk")
-    sector_exposure: Dict[str, float] = Field(..., description="Sector exposure percentages")
-    risk_recommendations: List[str] = Field(..., description="Risk management recommendations")
+    company_name: str = Field(..., description="Full company name")
+    risk_metrics: RiskMetrics = Field(..., description="Key risk metrics")
+    risk_factors: List[str] = Field(..., description="Key identified risk factors")
+    risk_mitigations: List[str] = Field(..., description="Potential risk mitigations")
+    risk_limits: RiskLimits = Field(..., description="Recommended risk limits")
+    risk_rating: int = Field(..., ge=1, le=10, description="Overall risk rating from 1-10")
+    risk_commentary: str = Field(..., description="Commentary on key risks")
+    current_price: float = Field(..., description="Current stock price")
+    market_conditions: str = Field(..., description="Assessment of current market conditions")
 
 
 @agent
-async def analyze_risk(ticker: str, market_data: Dict[str, Any], current_portfolio: Optional[Dict[str, Any]] = None) -> PositionRisk:
-    """Analyze risk for a potential position and provide risk management recommendations.
+async def risk_assessment(ticker: str, company_data: Dict[str, Any], portfolio_data: Dict[str, Any]) -> RiskAssessment:
+    """Assess the risk of a potential investment.
 
     Args:
         ticker: The stock ticker symbol
-        market_data: Dictionary containing market and price data for the stock
-        current_portfolio: Optional dictionary with current portfolio holdings
+        company_data: Dictionary containing company financial and business data
+        portfolio_data: Current portfolio holdings and allocations
 
     Returns:
-        PositionRisk: A risk assessment for the position
+        RiskAssessment: A comprehensive risk assessment for the investment
     """
-    # This function will be executed by the AI model, which will analyze market data
-    # to provide risk assessment
-    pass
-
-
-@agent
-async def analyze_portfolio_risk(positions: List[Dict[str, Any]], market_data: Dict[str, Any]) -> PortfolioRisk:
-    """Analyze overall portfolio risk and provide risk management recommendations.
-
-    Args:
-        positions: List of dictionaries with position details
-        market_data: Dictionary containing market data for the positions
-
-    Returns:
-        PortfolioRisk: A comprehensive portfolio risk assessment
-    """
-    # This function will be executed by the AI model, which will analyze portfolio positions
-    # to provide overall risk assessment
+    # This function will be executed by the AI model, which will provide a risk assessment
+    # based on the company and portfolio data
     pass

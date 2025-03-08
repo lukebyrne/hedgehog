@@ -1,62 +1,79 @@
 #!/bin/bash
 
-# Check if Python is available through the project's virtual environment
-if [ -d ".venv" ]; then
-    PYTHON=".venv/bin/python"
-elif [ -d "venv" ]; then
-    PYTHON="venv/bin/python"
+# Colors for better formatting
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+echo -e "${CYAN}🦔 Hedgehog AI Hedge Fund 🦔${NC}"
+echo ""
+
+# Check for Python environment
+if [ ! -d ".venv" ]; then
+    echo -e "${YELLOW}Virtual environment not found. Setting up...${NC}"
+    python -m venv .venv
+    source .venv/bin/activate
+    pip install -e .
 else
-    # Try system python3
-    PYTHON="python3"
+    source .venv/bin/activate
 fi
 
-# Check if Python is available
-if ! command -v $PYTHON &> /dev/null; then
-    echo "Error: Python interpreter not found. Please ensure Python is installed."
+# Check for .env file
+if [ ! -f ".env" ]; then
+    echo -e "${RED}Error: .env file not found.${NC}"
+    echo "Creating example .env file. Please edit with your API keys."
+    echo "OPENROUTER_API_KEY=your_openrouter_api_key" > .env
+    echo "FINANCIAL_DATASETS_API_KEY=your_financial_datasets_api_key" >> .env
+    echo "HEDGEHOG_DARK_MODE=0" >> .env
     exit 1
 fi
 
-# Use dark mode by default
-DARK_MODE=1
+# Display menu
+echo "Please select an option:"
+echo -e "${GREEN}1.${NC} Analyze stocks (interactive mode)"
+echo -e "${GREEN}2.${NC} Run backtest (last 6 months)"
+echo -e "${GREEN}3.${NC} Analyze FAANG stocks (Apple, Amazon, Meta, Google, Netflix)"
+echo -e "${GREEN}4.${NC} Analyze semiconductor stocks (NVDA, AMD, INTC, TSM, AVGO)"
+echo -e "${GREEN}5.${NC} Run custom command"
+echo -e "${GREEN}q.${NC} Quit"
+echo ""
 
-# Check for mode flags
-for arg in "$@"; do
-    if [ "$arg" == "--light-mode" ]; then
-        DARK_MODE=0
-        # Remove --light-mode from args
-        args=()
-        for val in "$@"; do
-            if [ "$val" != "--light-mode" ]; then
-                args+=("$val")
-            fi
-        done
-        set -- "${args[@]}"
-    elif [ "$arg" == "--dark-mode" ]; then
-        # Remove redundant --dark-mode flag since it's the default
-        args=()
-        for val in "$@"; do
-            if [ "$val" != "--dark-mode" ]; then
-                args+=("$val")
-            fi
-        done
-        set -- "${args[@]}"
-    fi
-done
+read -p "Enter your choice: " choice
 
-# Export dark mode setting as environment variable
-export HEDGEHOG_DARK_MODE=$DARK_MODE
-
-# Display mode info
-if [ $DARK_MODE -eq 1 ]; then
-    echo -e "\033[36m[DARK MODE ENABLED]\033[0m"
-else
-    echo -e "\033[96m[LIGHT MODE ENABLED]\033[0m"
-fi
-
-# Default to analyze AAPL, NVDA, and MSFT with interactive mode if no args provided
-if [ $# -eq 0 ]; then
-    $PYTHON -m hedgehog.main analyze AAPL NVDA MSFT --interactive
-else
-    # Execute with the provided arguments
-    $PYTHON -m hedgehog.main "$@"
-fi
+case $choice in
+    1)
+        echo -e "${CYAN}Running stock analysis in interactive mode...${NC}"
+        python -m hedgehog.main analyze AAPL MSFT GOOGL --interactive
+        ;;
+    2)
+        echo -e "${CYAN}Running backtest for last 6 months...${NC}"
+        # Calculate dates
+        END_DATE=$(date +%Y-%m-%d)
+        START_DATE=$(date -v-6m +%Y-%m-%d 2>/dev/null || date --date="6 months ago" +%Y-%m-%d)
+        echo "From $START_DATE to $END_DATE"
+        python -m hedgehog.main backtest AAPL MSFT GOOGL AMZN META --start=$START_DATE --end=$END_DATE
+        ;;
+    3)
+        echo -e "${CYAN}Analyzing FAANG stocks...${NC}"
+        python -m hedgehog.main analyze AAPL AMZN META GOOGL NFLX --interactive
+        ;;
+    4)
+        echo -e "${CYAN}Analyzing semiconductor stocks...${NC}"
+        python -m hedgehog.main analyze NVDA AMD INTC TSM AVGO --interactive
+        ;;
+    5)
+        echo -e "${YELLOW}Enter command to run (python -m hedgehog.main ...):${NC}"
+        read -p "> " cmd
+        eval $cmd
+        ;;
+    q|Q)
+        echo -e "${CYAN}Exiting. Thank you for using Hedgehog!${NC}"
+        exit 0
+        ;;
+    *)
+        echo -e "${RED}Invalid option. Exiting.${NC}"
+        exit 1
+        ;;
+esac

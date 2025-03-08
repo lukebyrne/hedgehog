@@ -1,20 +1,20 @@
-"""Bill Ackman agent that applies his investment philosophy to analyze stocks."""
+"""Bill Ackman agent that applies his activist investing principles to analyze stocks."""
 
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 from pydantic_ai import agent
 
 
-class AckmanPrinciples(BaseModel):
-    """Bill Ackman's key investment principles applied to a company."""
+class AckmanCriteria(BaseModel):
+    """Bill Ackman's key activist investing criteria applied to a company."""
 
-    simple_business: str = Field(..., description="Assessment of business simplicity and understandability")
-    free_cash_flow: str = Field(..., description="Assessment of free cash flow generation")
-    dominant_market_position: str = Field(..., description="Assessment of market dominance")
-    high_barriers_to_entry: str = Field(..., description="Assessment of competitive barriers")
-    limited_exposure_to_factors: str = Field(..., description="Assessment of exogenous risk factors")
-    attractive_valuation: str = Field(..., description="Assessment of valuation versus intrinsic value")
-    strong_growth_potential: str = Field(..., description="Assessment of long-term growth potential")
+    business_quality: str = Field(..., description="Assessment of fundamental business quality")
+    cash_flow_generation: str = Field(..., description="Assessment of cash flow generation capabilities")
+    management_competence: str = Field(..., description="Assessment of management competence and alignment")
+    capital_allocation: str = Field(..., description="Assessment of capital allocation efficiency")
+    corporate_governance: str = Field(..., description="Assessment of corporate governance structure")
+    balance_sheet_strength: str = Field(..., description="Assessment of balance sheet strength")
+    activist_opportunity: str = Field(..., description="Assessment of potential for activist intervention")
 
 
 class AckmanAnalysis(BaseModel):
@@ -22,11 +22,12 @@ class AckmanAnalysis(BaseModel):
 
     ticker: str = Field(..., description="Stock ticker symbol")
     company_name: str = Field(..., description="Full company name")
-    principles: AckmanPrinciples = Field(..., description="Ackman investment principles applied")
+    criteria: AckmanCriteria = Field(..., description="Ackman investing criteria applied")
     strengths: List[str] = Field(..., description="Key strengths from Ackman's perspective")
     concerns: List[str] = Field(..., description="Key concerns from Ackman's perspective")
-    activist_potential: bool = Field(..., description="Whether company has activist investor potential")
+    catalyst_potential: List[str] = Field(..., description="Potential catalysts for value realization")
     would_invest: bool = Field(..., description="Whether Ackman would likely invest")
+    would_engage: bool = Field(..., description="Whether Ackman would engage actively with management")
     rating: int = Field(..., ge=1, le=10, description="Overall Ackman rating from 1-10")
     recommendation: str = Field(..., description="Investment recommendation (Buy/Hold/Sell)")
     reasoning: str = Field(..., description="Reasoning behind recommendation")
@@ -34,7 +35,7 @@ class AckmanAnalysis(BaseModel):
 
 @agent
 async def ackman_analysis(ticker: str, company_data: Dict[str, Any]) -> AckmanAnalysis:
-    """Analyze a company using Bill Ackman's investment principles.
+    """Analyze a company using Bill Ackman's activist investing principles.
 
     Args:
         ticker: The stock ticker symbol
